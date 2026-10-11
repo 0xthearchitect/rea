@@ -383,7 +383,11 @@ to the CLI entrypoint being verified. The command builds and checks source-owned
 ELF fixtures before testing the read-only Hopper setup plan, approved
 installation, scoped doctor, real CLI/MCP analysis, rejection of a modified
 launcher, idempotent setup without requesting a reinstall, and owned child
-cleanup. It requires the repository's pinned development toolchain and an
+cleanup. Before installation and after teardown, a clean-runner process scan
+also rejects surviving Hopper demo helpers or Xvfb groups, including orphans
+whose launcher exited. This scan observes processes without signaling them;
+the dedicated runner must have no unrelated Hopper/Xvfb sessions. It requires
+the repository's pinned development toolchain and an
 existing host C compiler, `file`, `nm`, and `strings`. Use `verify:hopper:linux`
 instead when Hopper is already installed.
 

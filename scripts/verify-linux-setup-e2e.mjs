@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { assertCleanLinuxHopperRuntime } from "./lib/clean-linux-hopper-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const verifierRun = createVerifierRun();
@@ -19,6 +20,7 @@ const command = process.env.REA_VERIFY_SERVER_COMMAND;
 if (process.platform !== "linux" || process.getuid?.() !== 0)
   throw new Error("Linux setup verification requires a root Linux runner");
 if (!command) throw new Error("REA_VERIFY_SERVER_COMMAND is required");
+await assertCleanLinuxHopperRuntime();
 try {
   await access("/opt/hopper/bin/Hopper");
   throw new Error("Linux setup verification requires a clean runner");
@@ -110,6 +112,7 @@ if (
   repeated.appliedActions.length !== 0
 )
   throw new Error("a second setup was not idempotent");
+await assertCleanLinuxHopperRuntime();
 const completedVerifierRun = await completeVerifierRun(verifierRun);
 if (
   completedVerifierRun.process_lineage.status !== "verified" ||
