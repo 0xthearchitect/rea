@@ -31,6 +31,7 @@ export const assertCleanLinuxHopperRuntime = async (
   if (launchers.length === 0) return;
   // /proc exposes the executed file even when argv[0] names a removed symlink.
   // Compare file identity, not a display path or a process name.
+  let inspectionError;
   for (const entry of await readdir("/proc", { withFileTypes: true })) {
     if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
     let executable;
@@ -47,7 +48,10 @@ export const assertCleanLinuxHopperRuntime = async (
         });
         if (owner === undefined || owner.uid !== process.getuid()) continue;
       }
-      throw error;
+      // Finish the inventory so an unrelated restricted process cannot mask a
+      // positively identified leak. Unknown caller processes still fail closed.
+      inspectionError ??= error;
+      continue;
     }
     if (
       launchers.some(
@@ -56,4 +60,5 @@ export const assertCleanLinuxHopperRuntime = async (
     )
       throw new Error("Clean Linux runner retained a Hopper demo process");
   }
+  if (inspectionError !== undefined) throw inspectionError;
 };
