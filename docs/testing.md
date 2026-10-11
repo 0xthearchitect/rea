@@ -385,8 +385,10 @@ installation, scoped doctor, real CLI/MCP analysis, rejection of a modified
 launcher, idempotent setup without requesting a reinstall, and owned child
 cleanup. Before installation and after teardown, a clean-runner process scan
 also rejects surviving Hopper demo helpers or Xvfb groups, including orphans
-whose launcher exited. This scan observes processes without signaling them;
-the dedicated runner must have no unrelated Hopper/Xvfb sessions. It requires
+whose launcher exited. This scan observes processes without signaling them.
+Hopper detection compares executable file identity through `/proc`, covering
+alternate or configured launcher paths even after an invoked symlink is removed.
+The dedicated runner must have no unrelated Hopper/Xvfb sessions. It requires
 the repository's pinned development toolchain and an
 existing host C compiler, `file`, `nm`, and `strings`. Use `verify:hopper:linux`
 instead when Hopper is already installed.

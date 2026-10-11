@@ -1,1 +1,3 @@
-export function assertCleanLinuxHopperRuntime(): Promise<void>;
+export function assertCleanLinuxHopperRuntime(
+  launcherPaths?: readonly string[],
+): Promise<void>;

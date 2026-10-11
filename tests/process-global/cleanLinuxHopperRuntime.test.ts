@@ -1,5 +1,16 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import {
+  chmod,
+  copyFile,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  unlink,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { expect, it } from "vitest";
@@ -10,21 +21,34 @@ import { cleanupOwnedProcessGroup } from "../../src/process/ProcessOwnership.js"
 
 const execFileAsync = promisify(execFile);
 
-it.runIf(process.platform === "linux")(
-  "rejects a reparented demo process without signaling it",
-  async () => {
+it
+  .runIf(process.platform === "linux")
+  .each(["demo helper", "alternate launcher"])(
+  "rejects a reparented %s without signaling it",
+  async (mode) => {
     const runId = randomUUID();
     const childCode =
       "process.title = 'Xvfb'; setInterval(() => {}, 1000); process.send('ready');";
+    const directory = await mkdtemp(join(tmpdir(), "rea-clean-runtime-test-"));
+    const launcher = join(directory, "Hopper");
+    const alternate = join(directory, "Hopper-alternate");
+    const alternateMode = mode === "alternate launcher";
+    if (alternateMode) {
+      await copyFile("/usr/bin/sleep", launcher);
+      await chmod(launcher, 0o700);
+      await symlink(launcher, alternate);
+    }
+    const command = alternateMode ? alternate : process.execPath;
+    const arguments_ = alternateMode ? ["30"] : ["-e", childCode];
     const parentCode = `
       const { spawn } = require('node:child_process');
-      const child = spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], {
-        detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc']
+      const child = spawn(${JSON.stringify(command)}, ${JSON.stringify(arguments_)}, {
+        detached: true, stdio: ${JSON.stringify(alternateMode ? "ignore" : ["ignore", "ignore", "ignore", "ipc"])}
       });
       child.once('error', () => process.exit(1));
-      child.once('message', () => {
+      child.once(${JSON.stringify(alternateMode ? "spawn" : "message")}, () => {
         process.stdout.write(JSON.stringify({ pid: child.pid, parentPid: process.pid }));
-        child.disconnect();
+        if (child.connected) child.disconnect();
         child.unref();
       });
     `;
@@ -64,9 +88,17 @@ it.runIf(process.platform === "linux")(
           lineage.process_lineage.descendants.some((p) => p.pid === pid),
         ).toBe(false);
 
-      await expect(assertCleanLinuxHopperRuntime()).rejects.toThrow(
-        "Clean Linux runner retained a Hopper demo process",
-      );
+      if (alternateMode) {
+        const commandLine = await readFile(
+          `/proc/${String(pid)}/cmdline`,
+          "utf8",
+        );
+        expect(commandLine.split("\0")[0]).toBe(alternate);
+        await unlink(alternate);
+      }
+      await expect(
+        assertCleanLinuxHopperRuntime(alternateMode ? [launcher] : []),
+      ).rejects.toThrow("Clean Linux runner retained a Hopper demo process");
       // Observation must not terminate the fixture, even though it resembles Xvfb.
       const { stdout: alive } = await execFileAsync("ps", [
         "-p",
@@ -84,6 +116,7 @@ it.runIf(process.platform === "linux")(
         });
         expect(cleanup.cleaned, JSON.stringify(cleanup)).toBe(true);
       }
+      await rm(directory, { recursive: true, force: true });
     }
   },
 );
