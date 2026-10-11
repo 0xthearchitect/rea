@@ -372,15 +372,17 @@ cover active and queued expiry, late replies and timer cleanup.
 The Linux demo lane remains a separate `verify:hopper:linux` command. Hopper
 6.4.2's ELF loader did not recognize the original 4,119-byte literal or three
 non-ASCII byte strings in the measured fixtures. The lane retains complete raw
-byte checks for those literals through source-owned symbols and reports absent
-recognition with decoded-object coverage explicitly unverified. Recognized
-objects must still match their source bytes, encoding, filters and searches.
+byte checks for those literals through source-owned symbols. Recognition of the
+original full-length literal is bound to its exact source address; its decoded
+object coverage remains explicitly unverified on Linux even when recognized.
+Absent non-ASCII recognition also reports decoded-object coverage as unverified.
+Recognized non-ASCII and control-text objects must still match their source
+bytes, encoding, filters and searches.
 A separate 548-byte ASCII literal requires native fragmentation, shortened
 provider display, complete decoded fragments and dossier provenance on Linux;
 the macOS lane retains the original full-length recognition requirement. These
 are observed fixture/build capabilities, not universal Hopper length limits.
-Its
-lifecycle checks attempt competing CLI launches for the active target and a
+Its lifecycle checks attempt competing CLI launches for the active target and a
 different target, requiring rejection before either can change the owning
 MCP session's documents or procedures. Lease boundary tests also preserve
 unresponsive or malformed live endpoints while allowing confirmed stale

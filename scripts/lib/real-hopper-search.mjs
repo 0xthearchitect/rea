@@ -125,6 +125,7 @@ async function verifySearchModes(call, address) {
     (item) => long.startsWith(item.value) && item.value.startsWith("REA_"),
   );
   assert.ok(longItem, "fixture omitted its real long literal");
+  if (!linux) assert.equal(longItem.address, raw.address);
   assert.ok(long.startsWith(longItem.value));
   assert.ok(longItem.provider_value.endsWith("…"));
   assert.equal(longItem.string.termination, "missing");
@@ -218,11 +219,15 @@ async function verifySearchModes(call, address) {
   return {
     fullLiteralSourceBytes: fullBytes.length,
     fragmentedLiteralSourceBytes: Buffer.byteLength(long),
-    fullLiteralRecognition: strings.some((item) =>
-      item.value.startsWith("REA_LONG_LITERAL_"),
-    )
-      ? "observed"
-      : "not_observed",
+    fullLiteralRecognition: {
+      address: raw.address,
+      state: strings.some((item) => item.address === raw.address)
+        ? "observed"
+        : "not_observed",
+      // Linux validates the original through raw bytes; its required decoded
+      // fragment/dossier checks exercise the separate supported-size literal.
+      decodedObject: linux ? "unverified" : "verified",
+    },
     ...objects,
   };
 }
