@@ -1,5 +1,9 @@
 import { readClientPolicyBlock } from "./GeminiClientSettings.js";
-import { readClientConfigurationFiles } from "./ClientConfigurationFiles.js";
+import {
+  readClientConfigurationFiles,
+  readConfigurationText,
+} from "./ClientConfigurationFiles.js";
+import { err, ok, type Result } from "../domain/result.js";
 import {
   clientRegistrationEntry,
   clientConfigurationValuesEqual,
@@ -8,10 +12,12 @@ import {
   legacyClientServerPath,
   OMP_DISABLED_SERVERS_KEY,
   parseClientConfiguration,
+  parseZcodeFallbackConfiguration,
   serializeClientConfiguration,
   withClientServers,
   type ClientConfigurationDocument,
 } from "./ClientConfigurationDocument.js";
+import { dshDocument, DshCordisDocument } from "./DshCordisPatch.js";
 import { constants as fsConstants } from "node:fs";
 import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -58,6 +64,13 @@ const configureClientDocument = async (
     throwCleanupFailure(files.error);
     return { status: "failed", reason: "readback" };
   }
+  const existing = files.value.at(-1);
+  const editabilityError =
+    existing?.dialect === "dsh"
+      ? dshDocument(existing.document).editabilityError
+      : undefined;
+  if (editabilityError !== undefined)
+    return { status: "failed", reason: "readback" };
   const policy = await readClientPolicyBlock(
     client,
     undefined,
@@ -89,7 +102,10 @@ const configureClientDocument = async (
   let parsed: ClientConfigurationDocument;
   try {
     parsed = parseClientConfiguration(
-      original ?? (format === "toml" || format === "grok" ? "" : "{}"),
+      original ??
+        (format === "toml" || format === "grok" || format === "dsh"
+          ? ""
+          : "{}"),
       format,
     );
     const policy = await readClientPolicyBlock(
@@ -109,12 +125,15 @@ const configureClientDocument = async (
     void cause;
     return { status: "failed", reason: "readback" };
   }
-  const desired = clientConfigurationDesired(
-    client,
-    environment,
-    command,
-    parsed,
-  );
+  const fallback = await readZcodeFallbackServers(client, parsed);
+  if (!fallback.ok) {
+    throwCleanupFailure(fallback.error);
+    return { status: "failed", reason: "readback" };
+  }
+  const desired = clientConfigurationDesired(client, environment, command, {
+    ...parsed,
+    servers: { ...fallback.value, ...parsed.servers },
+  });
   if (registrationCurrent(parsed, desired)) return { status: "unchanged" };
   return persistClientConfiguration({
     client,
@@ -123,6 +142,7 @@ const configureClientDocument = async (
     original,
     parsed,
     desired,
+    fallbackServers: fallback.value,
   });
 };
 
@@ -133,6 +153,7 @@ interface ClientConfigurationUpdate {
   readonly original: string | undefined;
   readonly parsed: ClientConfigurationDocument;
   readonly desired: unknown;
+  readonly fallbackServers: Readonly<Record<string, unknown>>;
 }
 
 const persistClientConfiguration = async ({
@@ -142,6 +163,7 @@ const persistClientConfiguration = async ({
   original,
   parsed,
   desired,
+  fallbackServers,
 }: ClientConfigurationUpdate): Promise<ClientConfigurationResult> => {
   const backupPath =
     original === undefined ? undefined : `${client.configPath}.rea.backup`;
@@ -158,7 +180,11 @@ const persistClientConfiguration = async ({
   );
   const registered = withClientServers(
     parsed,
-    { ...parsed.servers, [PRODUCT_IDENTITY.mcpServerKey]: desired },
+    {
+      ...fallbackServers,
+      ...parsed.servers,
+      [PRODUCT_IDENTITY.mcpServerKey]: desired,
+    },
     PRODUCT_IDENTITY.mcpServerKey,
   );
   // OMP's denylist would hide the registration; keep every other listed name.
@@ -183,6 +209,9 @@ const persistClientConfiguration = async ({
     await writeFileAtomic(
       transactionPath,
       serializeClientConfiguration(document, format, original, [
+        ...Object.keys(fallbackServers)
+          .filter((name) => name !== PRODUCT_IDENTITY.mcpServerKey)
+          .map((name) => clientServerPath(parsed, name)),
         clientServerPath(parsed, PRODUCT_IDENTITY.mcpServerKey),
         ...(legacyPath === undefined ? [] : [legacyPath]),
         ...(enableOmp ? [[OMP_DISABLED_SERVERS_KEY]] : []),
@@ -202,7 +231,14 @@ const persistClientConfiguration = async ({
       await readRegularFileText(transactionPath),
       format,
     );
-    if (!registrationCurrent(readback, desired)) {
+    if (
+      !registrationCurrent(readback, desired) ||
+      Object.entries(fallbackServers).some(
+        ([name, entry]) =>
+          name !== PRODUCT_IDENTITY.mcpServerKey &&
+          !clientConfigurationValuesEqual(readback.servers[name], entry),
+      )
+    ) {
       await restoreConfig(transactionPath, original);
       return { status: "failed", reason: "readback" };
     }
@@ -280,15 +316,20 @@ export const inspectClientConfiguration = async (
       remediation: files.error.detail,
     };
   }
+  const existing = files.value.at(-1);
+  const editabilityError =
+    existing?.dialect === "dsh"
+      ? dshDocument(existing.document).editabilityError
+      : undefined;
+  if (editabilityError !== undefined)
+    return {
+      status: "invalid",
+      remediation: editabilityError.message,
+    };
   const policy = await readClientPolicyBlock(
     client,
     undefined,
-    clientConfigurationDesired(
-      client,
-      providerEnvironment,
-      command,
-      files.value.at(-1),
-    ),
+    clientConfigurationDesired(client, providerEnvironment, command, existing),
   );
   if (!policy.ok) {
     throwCleanupFailure(policy.error);
@@ -313,7 +354,14 @@ export const inspectClientConfiguration = async (
     original = await readRegularFileText(transactionPath);
   } catch (cause: unknown) {
     if (cause instanceof RegularFileCleanupFailure) throw cause;
-    if (isMissing(cause)) return { status: "create" };
+    if (isMissing(cause)) {
+      const fallback = await readZcodeFallbackServers(client);
+      if (!fallback.ok) {
+        throwCleanupFailure(fallback.error);
+        return { status: "invalid", remediation: fallback.error.detail };
+      }
+      return { status: "create" };
+    }
     return {
       status: "invalid",
       remediation: `The configuration file could not be read. Check its permissions before rerunning setup. ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -343,6 +391,11 @@ export const inspectClientConfiguration = async (
     );
     if (registrationCurrent(parsed, desired))
       return { status: "already_current" };
+    const fallback = await readZcodeFallbackServers(client, parsed);
+    if (!fallback.ok) {
+      throwCleanupFailure(fallback.error);
+      return { status: "invalid", remediation: fallback.error.detail };
+    }
   } catch (cause: unknown) {
     if (cause instanceof RegularFileCleanupFailure) throw cause;
     // Malformed configuration is reported with the invalid remediation.
@@ -364,6 +417,48 @@ const isMissing = (cause: unknown): boolean =>
 
 const throwCleanupFailure = (error: ClientConfigurationFileError): void => {
   if (error.cleanupFailure !== undefined) throw error.cleanupFailure;
+};
+
+/** Admit the fallback only when the first native ZCode server would suppress it. */
+const readZcodeFallbackServers = async (
+  client: SetupClient,
+  parsed?: ClientConfigurationDocument,
+): Promise<
+  Result<Readonly<Record<string, unknown>>, ClientConfigurationFileError>
+> => {
+  if (
+    client.format !== "zcode" ||
+    (parsed !== undefined && Object.keys(parsed.servers).length > 0)
+  )
+    return ok({});
+  const path = client.zcodeFallbackPath;
+  const detail = `The ZCode fallback configuration ${path ?? "path"} is unresolved, malformed or unreadable. Repair it before rerunning setup: the first native server would suppress that fallback.`;
+  if (path === undefined)
+    return err({ kind: "unreadable", path: client.configPath, detail });
+  const transactionPath = await resolveClientConfigTransactionPath(path);
+  if (transactionPath === undefined)
+    return err({ kind: "unreadable", path, detail });
+  const source = await readConfigurationText(transactionPath);
+  if (!source.ok)
+    return err({ ...source.error, detail: `${detail} ${source.error.detail}` });
+  if (source.value === undefined) return ok({});
+  try {
+    const parsed = parseZcodeFallbackConfiguration(source.value);
+    const environment = clientRegistrationEnvironment(parsed);
+    if (!environment.ok)
+      return err({
+        kind: "malformed",
+        path,
+        detail: `${detail} ${environment.error.settings.map(({ setting, constraint }) => `${setting}: ${constraint}`).join("; ")}`,
+      });
+    return ok(parsed.servers);
+  } catch (cause: unknown) {
+    return err({
+      kind: "malformed",
+      path,
+      detail: `${detail} ${cause instanceof Error ? cause.message : String(cause)}`,
+    });
+  }
 };
 
 const preserveConfigBackup = async (
@@ -396,6 +491,7 @@ const registrationCurrent = (
   parsed: ClientConfigurationDocument,
   desired: unknown,
 ): boolean =>
+  (parsed.dialect !== "dsh" || dshDocument(parsed.document).ready) &&
   clientConfigurationValuesEqual(
     parsed.servers[PRODUCT_IDENTITY.mcpServerKey],
     desired,
@@ -410,6 +506,17 @@ const clientConfigurationDesired = (
   parsed?: ClientConfigurationDocument,
 ) => {
   const format = parsed?.dialect ?? client.format ?? "json";
+  const launcher =
+    command.length === 0 ? [PRODUCT_IDENTITY.cliBinary, "mcp"] : command;
+  if (format === "dsh") {
+    const desired = (
+      parsed === undefined
+        ? new DshCordisDocument("")
+        : dshDocument(parsed.document)
+    ).desired(launcher, providerEnvironment);
+    if (!desired.ok) throw desired.error;
+    return desired.value;
+  }
   // Preserve explicitly configured server settings, never the ambient process
   // environment. Newly discovered provider paths win only for their own keys.
   const environment = clientRegistrationEnvironment(
@@ -419,7 +526,7 @@ const clientConfigurationDesired = (
   if (!environment.ok) throw environment.error;
   const registration = clientRegistrationEntry(
     format,
-    command.length === 0 ? [PRODUCT_IDENTITY.cliBinary, "mcp"] : command,
+    launcher,
     environment.value,
   );
   return {

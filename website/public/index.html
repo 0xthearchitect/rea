@@ -90,7 +90,16 @@
       content="REA — Find out how software works. Reverse engineering with your coding agent."
     />
     <!-- website:sharing:end -->
-    <meta name="theme-color" content="#ffffff" />
+    <meta
+      name="theme-color"
+      content="#ffffff"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#1e1e2e"
+      media="(prefers-color-scheme: dark)"
+    />
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/styles.css" />
     <script src="assets/main.js" defer></script>
@@ -108,9 +117,9 @@
           ><span class="brand-caption" data-i18n-skip>Reverse Engineer Anything</span></a
         >
         <nav class="navigation" aria-label="Main navigation">
+          <a href="./get-started/" class="nav-start">Get started</a>
           <a href="./showcase/">Showcases</a>
           <a href="./blog/">Blog</a>
-          <a href="./get-started/" class="nav-start">Get started</a>
           <a href="./guides/">Guides</a>
           <a href="./faq/">FAQ</a>
         </nav>
@@ -217,7 +226,12 @@
             </p>
             <div class="actions">
               <a class="button" href="#what-is-re">See how REA works ↓</a>
-              <a class="button secondary" href="get-started/">Setup guide</a>
+              <a class="button secondary home-setup-link" href="get-started/"
+                >Get started
+                <span class="button-arrow" aria-hidden="true" data-i18n-skip
+                  >→</span
+                ></a
+              >
               <a class="text-link" href="showcase/">Showcases →</a>
             </div>
             <p class="home-expert-shortcut">

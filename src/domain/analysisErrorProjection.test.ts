@@ -25,6 +25,38 @@ import { ProviderSelectionError } from "./providerSelectionError.js";
 import { analysisErrorProjectionSchema } from "../contracts/errorSchemas.js";
 import { nativeCallPartialObservationSchema } from "./native/nativeCallPartialObservation.js";
 
+it("projects a published file receipt alongside retained cleanup failure", () => {
+  const projected = projectAnalysisError(
+    new EvidenceFileError("write", "io", {
+      path: "/tmp/evidence.json",
+      published: { path: "/tmp/evidence.json", bytes: 42 },
+      cleanup: {
+        reason: "staging directory is still owned",
+        resources: ["/tmp/.rea-write-abc"],
+      },
+      cause: new Error("cleanup incomplete"),
+    }),
+  );
+  expect(projected).toMatchObject({
+    code: "cleanup_incomplete",
+    message:
+      "The output file was published, but staging cleanup remains incomplete.",
+    remediation: {
+      action:
+        "Use the published file at details.published_path and resolve the reported staging cleanup failure.",
+    },
+    details: {
+      operation: "write",
+      path: "/tmp/evidence.json",
+      published: true,
+      published_path: "/tmp/evidence.json",
+      bytes: 42,
+      resources: ["/tmp/.rea-write-abc"],
+    },
+  });
+  expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
+});
+
 const nativeCallPartialObservation = nativeCallPartialObservationSchema.parse({
   kind: "native-call-observation",
   target: {
@@ -83,6 +115,40 @@ it("distinguishes unsupported target formats from unavailable provider capabilit
   expect(projected.remediation.action).not.toContain("doctor");
   expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
 });
+
+it.each([false, true])(
+  "marks occupied capacity retryable only while cleanup is confirmed: %s",
+  (cleanupIncomplete) => {
+    const projected = projectAnalysisError(
+      new AnalysisResourceConstraintError(
+        "inspect_sqlite_database",
+        "capacity",
+        "Inspection slots are occupied",
+        { max_concurrent_inspections: 2 },
+        cleanupIncomplete
+          ? {
+              cleanup: {
+                reason: "Snapshot removal denied",
+                resources: ["/private/snapshot"],
+              },
+            }
+          : undefined,
+      ),
+    );
+    expect(projected.retryable).toBe(!cleanupIncomplete);
+    expect(projected.code).toBe(
+      cleanupIncomplete ? "cleanup_incomplete" : "resource_constraint",
+    );
+    expect(projected.details).toMatchObject({
+      resource: "capacity",
+      reported_limits: { max_concurrent_inspections: 2 },
+    });
+    expect(projected.remediation.action).toContain("Wait");
+    expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(
+      true,
+    );
+  },
+);
 
 it.each([
   ["memory", null],
@@ -337,25 +403,33 @@ describe("analysis error projection: provider failures", () => {
     });
   });
 
-  it("preserves detached, actionable provider diagnostics", () => {
-    const diagnostics = {
-      runtime_root: "/tmp/rea-ghidra-fixture",
-      profile_digest: "a".repeat(64),
-      exit_code: 1,
-    };
-    const error = new ProviderAdapterError("ghidra", "health", {
-      diagnostics,
-    });
+  it.each(["adapter", "cancelled", "timeout"])(
+    "preserves detached, actionable diagnostics for %s errors",
+    (kind) => {
+      const diagnostics = {
+        runtime_root: "/tmp/rea-ghidra-fixture",
+        profile_digest: "a".repeat(64),
+        exit_code: 1,
+      };
+      const error =
+        kind === "adapter"
+          ? new ProviderAdapterError("ghidra", "health", { diagnostics })
+          : kind === "cancelled"
+            ? new AnalysisCancelledError("health", { diagnostics })
+            : new AnalysisTimeoutError("health", 250, { diagnostics });
 
-    expect(error.diagnostics).not.toBe(diagnostics);
-    expect(projectAnalysisError(error)).toMatchObject({
-      details: {
-        provider_id: "ghidra",
-        operation: "health",
-        diagnostics,
-      },
-    });
-  });
+      expect(error.diagnostics).not.toBe(diagnostics);
+      expect(projectAnalysisError(error)).toMatchObject({
+        details: {
+          ...(kind === "adapter" ? { provider_id: "ghidra" } : {}),
+          operation: "health",
+          diagnostics,
+        },
+      });
+      diagnostics.exit_code = 2;
+      expect(error.diagnostics?.exit_code).toBe(1);
+    },
+  );
 
   it("maps the Linux startup compatibility exit codes without host internals", () => {
     const expected = [

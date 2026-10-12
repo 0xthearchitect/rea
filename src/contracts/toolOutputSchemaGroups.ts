@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { artifactInventorySummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
 import { evidenceBundleSummarySchema } from "../domain/evidenceRecordSummary.js";
 import { BINARY_ARCHITECTURES } from "../domain/binaryTargetTypes.js";
 import {
@@ -37,7 +38,7 @@ import {
   listArchitecturesSchema,
 } from "../domain/native/nativeInspection.js";
 import { artifactExtractionResultSchema } from "../domain/artifactGraph.js";
-import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
+import { artifactInspectionOutputSchema } from "../domain/artifactInspection.js";
 import { interfaceBuilderAnalysisSchema } from "../domain/apple/interfaceBuilderGraph.js";
 import { dylibResolutionResultSchema } from "../domain/apple/dylibResolution.js";
 import { keyedArchiveResultSchema } from "../domain/apple/keyedArchive.js";
@@ -59,6 +60,7 @@ import { callPathResultSchema } from "../domain/callPathSchemas.js";
 import { staticRuntimeCorrelationResultSchema } from "../domain/staticRuntimeCorrelation.js";
 import { reconstructionVerificationResultSchema } from "../domain/reconstructionVerificationSchemas.js";
 import { analysisErrorProjectionSchema } from "./errorSchemas.js";
+import { relationshipCoverageSchema } from "../domain/relationshipCoverage.js";
 import { nativeDispatchMetadataResultSchema } from "../domain/native/objcSwiftMetadata.js";
 import { nativeInvestigationTraceSchema } from "../domain/native/nativeInvestigationGraph.js";
 import {
@@ -219,7 +221,7 @@ const callPathTraceOutput = evidenceResultOf(
     start: z.string(),
     goal: z.string().nullable(),
     direction: z.enum(["forward", "backward"]),
-    goal_status: z.enum(["not_requested", "reached", "not_reached"]),
+    goal_status: z.enum(["not_requested", "reached", "not_reached", "unknown"]),
     nodes: z.array(
       z.object({
         address: z.string(),
@@ -240,6 +242,7 @@ const callPathTraceOutput = evidenceResultOf(
         error: analysisErrorProjectionSchema,
       }),
     ),
+    relationship_coverage: z.record(z.string(), relationshipCoverageSchema),
     traversal: z.object({
       nodes_visited: z.number().int().min(1),
     }),
@@ -302,7 +305,12 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
       failed: z.number().int().min(0),
     }),
   ),
-  get_call_graph: evidenceResultOf(z.record(z.string(), z.array(graphNode))),
+  get_call_graph: evidenceResultOf(
+    z.strictObject({
+      graph: z.record(z.string(), z.array(graphNode)),
+      limitations: z.array(z.string()),
+    }),
+  ),
   analyze_swift_types: evidenceResultOf(
     z.object({
       total: z.number().int().min(0),
@@ -356,6 +364,7 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
       segment_count: z.number().int().min(0),
       procedure_count: z.number().int().min(0),
       string_count: z.number().int().min(0),
+      image_base: z.string().min(1).optional(),
     }),
   ),
   analyze_function: functionDossierOutput,
@@ -378,7 +387,12 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
 
 /** Exact Evidence schemas for provider-neutral artifact graph operations. */
 export const artifactOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
-  inspect_artifact: evidenceResultOf(artifactInspectionResultSchema),
+  inspect_artifact: evidenceResultOf(
+    z.union([
+      artifactInspectionOutputSchema,
+      artifactInventorySummaryViewResultSchema,
+    ]),
+  ),
   extract_artifact: evidenceResultOf(artifactExtractionResultSchema),
   decode_interface_builder: evidenceResultOf(interfaceBuilderAnalysisSchema),
   inspect_keyed_archive: evidenceResultOf(keyedArchiveResultSchema),

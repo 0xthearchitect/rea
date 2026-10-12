@@ -1,15 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
-  chmod,
-  copyFile,
-  mkdtemp,
-  readFile,
-  rm,
-  symlink,
-  unlink,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, copyFile, readFile, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -18,6 +9,7 @@ import { expect, it } from "vitest";
 import { assertCleanLinuxHopperRuntime } from "../../scripts/lib/clean-linux-hopper-runtime.mjs";
 import { completeVerifierRun } from "../../scripts/lib/verifier-run.mjs";
 import { cleanupOwnedProcessGroup } from "../../src/process/ProcessOwnership.js";
+import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -29,7 +21,7 @@ it
     const runId = randomUUID();
     const childCode =
       "process.title = 'Xvfb'; setInterval(() => {}, 1000); process.send('ready');";
-    const directory = await mkdtemp(join(tmpdir(), "rea-clean-runtime-test-"));
+    const directory = await createTestTempDirectory("rea-clean-runtime-test-");
     const launcher = join(directory, "Hopper");
     const alternate = join(directory, "Hopper-alternate");
     const alternateMode = mode === "alternate launcher";
@@ -116,7 +108,6 @@ it
         });
         expect(cleanup.cleaned, JSON.stringify(cleanup)).toBe(true);
       }
-      await rm(directory, { recursive: true, force: true });
     }
   },
 );
