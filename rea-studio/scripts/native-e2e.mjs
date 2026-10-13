@@ -90,8 +90,13 @@ try {
     .waitFor({ timeout: 240000 });
   console.log("Real REA findings rendered in native UI");
   await page.getByLabel("Search investigation").fill("parser");
-  await page.getByRole("option").first().waitFor();
-  await page.getByRole("option").first().click();
+  const findings = page.getByRole("listbox", { name: "Analysis findings" });
+  const parserFinding = findings
+    .getByRole("option")
+    .filter({ hasText: "parser.js" })
+    .first();
+  await parserFinding.waitFor();
+  await parserFinding.click();
   await page
     .getByRole("button", { name: "Inspect original provenance" })
     .click();

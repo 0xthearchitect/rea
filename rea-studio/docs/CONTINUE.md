@@ -16,7 +16,7 @@ The toolchains, installed REA runtime, generated icons/bridge/frontend assets, b
 
 Install a trusted REA 6.4.x separately, then choose its `scripts/rea.mjs` and your Node executable in Connection settings. On Windows the official published package includes the native filesystem helper; building that helper from source uses upstream's Linux/MinGW lane. The researched source checkout and official package advertise different contracts even at version 6.4.0; Studio checks the actual schemas and availability.
 
-Read [verification status](VERIFICATION.md) first. The latest fix compiled but the complete native E2E acceptance gate is not yet complete. The existing UI and analyses must not be presented as a finished production release until that journey is verified.
+Read [verification status](VERIFICATION.md) first. The complete native vertical slice passed, including real analysis, Evidence, graph rendering, and restart persistence. This is an initial working implementation; the remaining native dialogs, source viewer, ASAR/platform coverage, standalone packaging, and linker warning require further verification before a production release.
 
 ```sh
 # Set REA_STUDIO_REA_ENTRY to the installed absolute scripts/rea.mjs.
