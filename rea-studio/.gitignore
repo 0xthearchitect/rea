@@ -1,0 +1,9 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/resources/bridge.mjs
+src-tauri/gen/
+src-tauri/icons/
+playwright-report/
+test-results/
+.local/
