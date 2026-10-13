@@ -119,12 +119,33 @@ it
     });
     expect(cleanup.handles).toHaveLength(1);
     expect(launches).toBe(launchCount);
+    let closingOperation = operation;
+    if (discovery) {
+      cleanup.denied = false;
+      const recovered = await service.inspect({
+        path,
+        fields: ["frame.number"],
+      });
+      expect(recovered.ok).toBe(true);
+      expect(cleanup.handles.every((handle) => handle.fd === -1)).toBe(true);
+      expect(launches).toBeGreaterThan(launchCount);
+      cleanup.denied = true;
+      expect(
+        await service.inspect({ path, fields: ["frame.number"] }),
+      ).toMatchObject({
+        ok: false,
+        error: { cleanupIncomplete: true, operation: "inspect_packet_capture" },
+      });
+      expect(cleanup.handles.at(-1)?.fd).toBeGreaterThanOrEqual(0);
+      closingOperation = "inspect_packet_capture";
+    }
     await expect(provider.close()).rejects.toMatchObject({
       cleanupIncomplete: true,
-      operation,
+      operation: closingOperation,
     });
     cleanup.denied = false;
     await provider.close();
     expect(cleanup.handles[0]?.fd).toBe(-1);
+    expect(cleanup.handles.every((handle) => handle.fd === -1)).toBe(true);
   },
 );
