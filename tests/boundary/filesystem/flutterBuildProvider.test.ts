@@ -1171,6 +1171,36 @@ it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
   },
 );
 
+it("names a missing or non-file APK selection instead of blaming package bytes", async () => {
+  const root = await createTestTempDirectory("rea-flutter-selection-");
+  const provider = new FlutterBuildProvider();
+  onTestFinished(() => provider.close());
+  for (const [path, message] of [
+    [join(root, "absent.apk"), "Selected APK does not exist"],
+    [root, "Selected APK is not a regular file"],
+  ] as const) {
+    for (const operation of [
+      "identify_flutter_build",
+      "inspect_dart_aot",
+    ] as const) {
+      const result = await provider.execute({ operation, input: { path } });
+      if (result.ok) throw new Error("A missing APK selection must fail");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "invalid_request",
+        details: {
+          issues: [
+            {
+              path: ["path"],
+              reason: "invalid_format",
+              message: `${message}: ${path}`,
+            },
+          ],
+        },
+      });
+    }
+  }
+});
+
 it.each(["EACCES", "EPERM"] as const)(
   "preserves %s at the shared source admission boundary",
   async (code) => {
