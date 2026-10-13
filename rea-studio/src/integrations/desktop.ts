@@ -8,6 +8,12 @@ import type {
   Graph,
   Evidence,
   Activity,
+  NativeRequest,
+  AgentSettings,
+  AgentConnection,
+  AgentConversation,
+  AgentTurnPage,
+  Json,
 } from "../types/models";
 export const desktopAvailable = isTauri();
 export function message(error: unknown): string {
@@ -26,6 +32,35 @@ async function call<T>(
   return invoke<T>(command, args);
 }
 export const api = {
+  hasActiveTask: () => call<boolean>("has_active_task"),
+  agentSettings: () => call<AgentSettings>("get_agent_settings"),
+  saveAgentSettings: (settings: AgentSettings) =>
+    call<void>("save_agent_settings", { settings }),
+  pickAgent: () => call<AgentSettings | null>("pick_agent_file"),
+  detectAgent: () => call<AgentConnection>("detect_agent"),
+  conversations: (projectId: string) =>
+    call<AgentConversation[]>("agent_conversations", { projectId }),
+  newConversation: (projectId: string) =>
+    call<string>("new_agent_conversation", { projectId }),
+  agentTurns: (conversationId: string, offset: number) =>
+    call<AgentTurnPage>("agent_turns", { conversationId, offset }),
+  agentContext: (projectId: string, jobId: string, entityId: string) =>
+    call<Json>("agent_context", { projectId, jobId, entityId }),
+  startAgent: (
+    conversationId: string,
+    question: string,
+    jobId: string,
+    entityId: string,
+    providerId?: string,
+  ) =>
+    call<string>("start_agent_turn", {
+      conversationId,
+      question,
+      jobId,
+      entityId,
+      providerId,
+    }),
+  cancelAgent: (turnId: string) => call<void>("cancel_agent_turn", { turnId }),
   settings: () => call<Settings>("get_settings"),
   pickDependency: (field: "node" | "rea") =>
     call<Settings | null>("pick_connection_file", { field }),
@@ -37,8 +72,12 @@ export const api = {
     call<void>("rename_project", { projectId, name }),
   delete: (projectId: string) => call<boolean>("delete_project", { projectId }),
   jobs: (projectId: string) => call<Job[]>("list_jobs", { projectId }),
-  start: (projectId: string, sourcePaths: string[]) =>
-    call<string>("start_analysis", { projectId, sourcePaths }),
+  start: (
+    projectId: string,
+    sourcePaths: string[],
+    nativeRequest?: NativeRequest,
+  ) =>
+    call<string>("start_analysis", { projectId, sourcePaths, nativeRequest }),
   cancel: (jobId: string) => call<void>("cancel_analysis", { jobId }),
   logs: (jobId: string) => call<Activity[]>("job_logs", { jobId }),
   entities: (jobId: string, search: string, kind: string, offset: number) =>

@@ -97,6 +97,16 @@ try {
     .first();
   await parserFinding.waitFor();
   await parserFinding.click();
+  await page.getByRole("button", { name: "Inspect available source" }).click();
+  await page
+    .getByText("Original source · digest verified", { exact: true })
+    .waitFor();
+  await page
+    .locator(".monaco-editor .view-lines")
+    .getByText("decodeRecord", { exact: false })
+    .first()
+    .waitFor();
+  console.log("Native source navigation rendered digest-verified original source");
   await page
     .getByRole("button", { name: "Inspect original provenance" })
     .click();

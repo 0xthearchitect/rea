@@ -6,7 +6,9 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:1420",
     viewport: { width: 1440, height: 940 },
-    channel: "msedge",
+    ...(process.env.STUDIO_BROWSER_CHANNEL
+      ? { channel: process.env.STUDIO_BROWSER_CHANNEL }
+      : {}),
   },
   webServer: {
     command: "node node_modules/vite/bin/vite.js --host 127.0.0.1",

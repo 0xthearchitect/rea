@@ -2,8 +2,17 @@ import { describe, expect, it } from "vitest";
 import { normalizeBundle, supportedVersion } from "../bridge/normalize";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-const paths = readdirSync(resolve(".local"), { withFileTypes: true })
+function verificationDirectories() {
+  try {
+    return readdirSync(resolve(".local"), { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+const paths = verificationDirectories()
   .filter((d) => d.isDirectory() && d.name.startsWith("verification-"))
+  .sort((a, b) => a.name.localeCompare(b.name))
   .map((d) => resolve(".local", d.name, "evidence.json"));
 let bundle:
   | {

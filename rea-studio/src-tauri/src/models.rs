@@ -41,6 +41,7 @@ pub struct Project {
     pub name: String,
     pub target: String,
     pub created_at: i64,
+    pub workflow: String,
 }
 #[derive(Serialize)]
 pub struct Job {
@@ -93,6 +94,7 @@ pub struct Evidence {
     pub facts: Value,
     pub raw_path: String,
     pub limitations: Value,
+    pub native: Option<Value>,
 }
 #[derive(Serialize)]
 pub struct Inspection {
@@ -124,6 +126,32 @@ pub struct Projection {
     pub input_path: String,
     pub coverage: String,
     pub limitations: Value,
+    #[serde(default)]
+    pub records: Vec<RecordHeader>,
+}
+#[derive(Deserialize)]
+pub struct RecordHeader {
+    pub evidence_id: String,
+    pub header: Value,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRequest {
+    pub operation: NativeOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub query: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeOperation {
+    Overview,
+    Procedures,
+    Strings,
+    Function,
+    Instructions,
+    References,
+    Instruction,
 }
 pub fn now() -> i64 {
     std::time::SystemTime::now()

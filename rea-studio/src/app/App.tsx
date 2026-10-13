@@ -46,7 +46,7 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import type { Entity, Job } from "../types/models";
+import type { Entity, Job, NativeOperation } from "../types/models";
 import { api, desktopAvailable, message } from "../integrations/desktop";
 import { useWorkspace } from "../stores/workspace";
 import type { View } from "../stores/workspace";
@@ -60,6 +60,17 @@ import {
 } from "../components/ui";
 const GraphView = lazy(() => import("../features/graphs/GraphView"));
 const CodeView = lazy(() => import("../features/editor/CodeView"));
+const AgentView = lazy(() => import("../features/agents/AgentView"));
+const NativeView = lazy(() => import("../features/native/NativeView"));
+const nativeNames: Record<NativeOperation, string> = {
+  overview: "Binary overview & sections",
+  procedures: "Find functions",
+  strings: "List strings",
+  function: "Function dossier & pseudocode",
+  instructions: "Function instructions",
+  references: "References to address",
+  instruction: "Inspect instruction or data address",
+};
 const icons: Record<string, ReactNode> = {
   findings: <Layers size={15} />,
   graph: <Network size={15} />,
@@ -146,6 +157,14 @@ export default function App() {
   const [projectName, setProjectName] = useState("");
   const [importFormat, setImportFormat] = useState("directory");
   const [sourcePaths, setSourcePaths] = useState("");
+  const [nativeOperation, setNativeOperation] =
+    useState<NativeOperation>("overview");
+  const [nativeProvider, setNativeProvider] = useState("");
+  const [nativeQuery, setNativeQuery] = useState("");
+  const [linkedJob, setLinkedJob] = useState<{
+    id: string;
+    project: string;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
@@ -168,7 +187,14 @@ export default function App() {
     enabled: desktopAvailable,
     staleTime: 30000,
   });
+  const activeTask = useQuery({
+    queryKey: ["active-task"],
+    queryFn: api.hasActiveTask,
+    enabled: desktopAvailable,
+    refetchInterval: 1000,
+  });
   const project = projects.data?.find((p) => p.id === ws.project);
+  const isNative = project?.workflow === "native";
   const jobs = useQuery({
     queryKey: ["jobs", ws.project],
     queryFn: () => api.jobs(ws.project),
@@ -188,6 +214,9 @@ export default function App() {
     enabled: !!resultId,
     staleTime: Infinity,
   });
+  useEffect(() => {
+    if (kind && kinds.data && !kinds.data.includes(kind)) setKind("");
+  }, [kind, kinds.data]);
   const entities = useQuery({
     queryKey: ["entities", resultId, debounced, kind, offset],
     queryFn: () => api.entities(resultId, debounced, kind, offset),
@@ -205,7 +234,7 @@ export default function App() {
   const source = useQuery({
     queryKey: ["source", resultId, ws.selected],
     queryFn: () => api.source(resultId, ws.selected),
-    enabled: !!resultId && !!ws.selected && ws.view === "source",
+    enabled: !!resultId && !!ws.selected && ws.view === "source" && !isNative,
     staleTime: 0,
   });
   const logs = useQuery({
@@ -290,6 +319,68 @@ export default function App() {
         ? "Connection error"
         : (connection.data?.state.replace("_", " ") ?? "Disconnected");
   const isConnected = connection.data?.state === "connected";
+  const canRun =
+    isConnected &&
+    (isNative
+      ? connection.data?.native?.can_open
+      : connection.data?.can_analyze);
+  const nativeOperationSupported =
+    connection.data?.native?.operations.find(
+      (o) => o.operation === nativeOperation,
+    )?.advertised === true;
+  async function followNative(operation: NativeOperation, address: string) {
+    if (!project || running || activeTask.data === true || !canRun || busy)
+      return;
+    await action(async () => {
+      const id = await api.start(project.id, [], {
+        operation,
+        query: address,
+        ...(evidence.data?.native?.provider_selection ??
+          (nativeProvider ? { provider_id: nativeProvider } : {})),
+      });
+      setLinkedJob({ id, project: project.id });
+      setSearch("");
+      setKind("");
+      setOffset(0);
+      ws.set({ job: id, selected: "", view: "findings", console: true });
+      await query.invalidateQueries({ queryKey: ["jobs"] });
+    });
+  }
+  useEffect(() => {
+    if (!linkedJob) return;
+    if (ws.project !== linkedJob.project || ws.job !== linkedJob.id) {
+      setLinkedJob(null);
+      return;
+    }
+    const linked = jobs.data?.find((j) => j.id === linkedJob.id);
+    if (!linked || activeStates.has(linked.state)) return;
+    if (linked.state !== "succeeded") {
+      setError(linked.message);
+      setLinkedJob(null);
+      return;
+    }
+    let live = true;
+    void api
+      .entities(linked.id, "", "", 0)
+      .then((page) => {
+        if (live && page.items[0])
+          ws.set({
+            selected: page.items[0].id,
+            view: "source",
+            inspector: true,
+          });
+        if (live) setLinkedJob(null);
+      })
+      .catch((e) => {
+        if (live) {
+          setError(message(e));
+          setLinkedJob(null);
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [linkedJob, jobs.data, ws.project, ws.job]);
   const inspection = evidence.data?.inspection;
   const selectedLabel =
     inspection?.label ??
@@ -311,7 +402,7 @@ export default function App() {
 
   return (
     <div
-      className="studio"
+      className={`studio ${ws.view === "agent" ? "agent-mode" : ""}`}
       style={
         {
           "--explorer-width": `${ws.left}px`,
@@ -484,13 +575,15 @@ export default function App() {
                     <span>{k}</span>
                   </button>
                 ))}
-                <button
-                  className="tree-item"
-                  onClick={() => switchView("graph")}
-                >
-                  <GitBranch size={14} />
-                  Application relationships
-                </button>
+                {!isNative && (
+                  <button
+                    className="tree-item"
+                    onClick={() => switchView("graph")}
+                  >
+                    <GitBranch size={14} />
+                    Application relationships
+                  </button>
+                )}
                 <button
                   className="tree-item"
                   onClick={() => switchView("evidence")}
@@ -588,7 +681,7 @@ export default function App() {
             {project && ws.view !== "connection" && (
               <Button
                 variant="primary"
-                disabled={!isConnected || busy || !!running}
+                disabled={!canRun || busy || !!running}
                 onClick={() => setLaunchOpen(true)}
               >
                 <Play size={14} />
@@ -614,23 +707,26 @@ export default function App() {
           </div>
         </div>
         <div className="tabs" role="tablist" aria-label="Investigation views">
-          {(["findings", "graph", "source", "evidence"] as const).map(
-            (view) => (
-              <button
-                key={view}
-                role="tab"
-                aria-selected={ws.view === view}
-                className={ws.view === view ? "active" : ""}
-                onClick={() => switchView(view)}
-              >
-                {icons[view]}
-                {viewNames[view]}
-                {view === "findings" && completedJob && (
-                  <span className="count">{completedJob.node_count}</span>
-                )}
-              </button>
-            ),
-          )}
+          {(isNative
+            ? (["findings", "source", "evidence"] as const)
+            : (["findings", "graph", "source", "evidence"] as const)
+          ).map((view) => (
+            <button
+              key={view}
+              role="tab"
+              aria-selected={ws.view === view}
+              className={ws.view === view ? "active" : ""}
+              onClick={() => switchView(view)}
+            >
+              {icons[view]}
+              {isNative && view === "source"
+                ? "Code & references"
+                : viewNames[view]}
+              {view === "findings" && completedJob && (
+                <span className="count">{completedJob.node_count}</span>
+              )}
+            </button>
+          ))}
           <span className="grow" />
           {completedJob && (
             <span className="tab-context">
@@ -759,6 +855,30 @@ export default function App() {
                   <Badge>{connection.data?.tools.length ?? 0} tools</Badge>
                 </div>
               </div>
+              <h3>Native analysis providers</h3>
+              {connection.data?.native?.providers.map((provider) => (
+                <div className="setting-field" key={provider.id}>
+                  <strong>
+                    {provider.name} {provider.version ?? ""}
+                  </strong>
+                  <span>
+                    {provider.reason ??
+                      (provider.available
+                        ? "Available; target support is checked when opening"
+                        : "Availability unknown")}
+                  </span>
+                  <Badge tone={provider.available ? "green" : "amber"}>
+                    {provider.available === null
+                      ? "Unknown"
+                      : provider.available
+                        ? "Available"
+                        : "Unavailable"}
+                  </Badge>
+                </div>
+              ))}
+              {!connection.data?.native?.providers.length && (
+                <p className="muted">Native provider discovery unavailable.</p>
+              )}
               <h3>Installation guidance</h3>
               <p>
                 Use Node 24.18.0 and REA 6.4.x. For this source checkout, run{" "}
@@ -783,21 +903,36 @@ export default function App() {
               )}
             </div>
           ) : ws.view === "agent" ? (
-            <Empty
-              icon={<Terminal size={32} />}
-              title="Agent integration is not configured"
-            >
-              <p>Deterministic REA exploration is available without an LLM.</p>
-              <p>
-                This release does not expose an agent transport, chat backend,
-                or target execution. Agent conclusions will require separate
-                provenance when a supported integration is added.
-              </p>
-              <Button onClick={() => switchView("findings")}>
-                <Layers size={14} />
-                Return to investigation
-              </Button>
-            </Empty>
+            <Suspense fallback={<Loading />}>
+              <AgentView
+                key={ws.project}
+                project={project}
+                projects={projects.data ?? []}
+                selectProject={(id) =>
+                  ws.set({ project: id, job: "", selected: "" })
+                }
+                jobId={resultId}
+                entityId={ws.selected}
+                selectionLabel={selectedLabel}
+                providerId={nativeProvider}
+                setProvider={setNativeProvider}
+                connection={connection.data}
+                busyAnalysis={!!running || activeTask.data === true}
+                openInvestigation={() => switchView("findings")}
+                importProject={() => {
+                  setProjectName("");
+                  setImportOpen(true);
+                }}
+                openEvidence={(jobId) =>
+                  ws.set({
+                    job: jobId,
+                    selected: "",
+                    view: "evidence",
+                    inspector: true,
+                  })
+                }
+              />
+            </Suspense>
           ) : !project ? (
             <div className="welcome">
               <div className="welcome-emblem">
@@ -877,7 +1012,9 @@ export default function App() {
             >
               <p>
                 {running?.message ??
-                  "Run static analysis to populate findings and their application relationships."}
+                  (isNative
+                    ? "Choose a native inspection task. REA checks the selected provider and target before analysis."
+                    : "Run static analysis to populate findings and their application relationships.")}
               </p>
               {running ? (
                 <Badge>
@@ -886,7 +1023,7 @@ export default function App() {
               ) : (
                 <Button
                   variant="primary"
-                  disabled={!isConnected || busy}
+                  disabled={!canRun || busy}
                   onClick={() => setLaunchOpen(true)}
                 >
                   <Play size={14} />
@@ -904,6 +1041,14 @@ export default function App() {
           ) : ws.view === "findings" ? (
             <div className="findings-view">
               <div className="view-toolbar">
+                {isNative && (
+                  <Button
+                    disabled={!ws.selected}
+                    onClick={() => switchView("source")}
+                  >
+                    Open selected finding
+                  </Button>
+                )}
                 <div className="search-input">
                   <Search size={15} />
                   <input
@@ -970,6 +1115,34 @@ export default function App() {
                 </>
               )}
             </div>
+          ) : isNative && (ws.view === "source" || ws.view === "graph") ? (
+            !ws.selected ? (
+              <Empty icon={<Code2 size={32} />} title="Select a native finding">
+                <p>
+                  Choose a function, string, section or inspection result from
+                  Findings.
+                </p>
+              </Empty>
+            ) : evidence.isPending ? (
+              <Loading />
+            ) : evidence.error ? (
+              <Failure text={message(evidence.error)} />
+            ) : evidence.data?.native ? (
+              <Suspense fallback={<Loading />}>
+                <NativeView
+                  key={ws.selected}
+                  view={evidence.data.native}
+                  follow={(operation, address) =>
+                    void followNative(operation, address)
+                  }
+                  disabled={
+                    busy || !!running || activeTask.data === true || !canRun
+                  }
+                />
+              </Suspense>
+            ) : (
+              <Failure text="This finding has no native display projection. Inspect its original Evidence." />
+            )
           ) : ws.view === "graph" ? (
             <Suspense fallback={<Loading label="Opening graph explorer…" />}>
               <GraphView
@@ -1067,7 +1240,7 @@ export default function App() {
           )}
         </div>
       </main>
-      {ws.inspector && (
+      {ws.inspector && ws.view !== "agent" && (
         <aside className="inspector">
           <Resizer side="right" />
           <div className="panel-heading">
@@ -1131,7 +1304,22 @@ export default function App() {
               {ws.selected && (
                 <Button className="wide" onClick={() => switchView("source")}>
                   <Code2 size={14} />
-                  Inspect available source
+                  {isNative
+                    ? "Inspect native code & details"
+                    : "Inspect available source"}
+                </Button>
+              )}
+              {isNative && evidence.data?.native?.procedure && (
+                <Button
+                  className="wide"
+                  disabled={!canRun || !!running}
+                  onClick={() => {
+                    setNativeQuery(evidence.data!.native!.procedure!);
+                    setNativeOperation("function");
+                    setLaunchOpen(true);
+                  }}
+                >
+                  Inspect this function
                 </Button>
               )}
               <div className="inspector-section">SOURCE LOCATION</div>
@@ -1150,7 +1338,7 @@ export default function App() {
           )}
         </aside>
       )}
-      {ws.console && (
+      {ws.console && ws.view !== "agent" && (
         <section className="console">
           <Resizer side="bottom" />
           <div className="console-header">
@@ -1193,7 +1381,11 @@ export default function App() {
                       className={`status-dot ${j.state === "succeeded" ? "online" : j.state === "failed" ? "failed" : ""}`}
                     />
                     <div>
-                      <strong>Static application analysis</strong>
+                      <strong>
+                        {isNative
+                          ? "Native inspection task"
+                          : "Static application analysis"}
+                      </strong>
                       <span>
                         {j.state} · {elapsed(j)}
                       </span>
@@ -1234,8 +1426,9 @@ export default function App() {
         <span className="grow" />
         {completedJob && (
           <span>
-            {completedJob.node_count} entities · {completedJob.edge_count}{" "}
-            relationships
+            {isNative
+              ? `${completedJob.node_count} findings`
+              : `${completedJob.node_count} entities · ${completedJob.edge_count} relationships`}
           </span>
         )}
         <span className="status-divider" />
@@ -1288,6 +1481,7 @@ export default function App() {
                 JavaScript application directory
               </option>
               <option value="asar">Electron ASAR archive</option>
+              <option value="native">Native binary (ELF / PE / Mach-O)</option>
             </select>
           </label>
           <p className="muted">
@@ -1311,20 +1505,111 @@ export default function App() {
       <Modal
         open={launchOpen}
         onOpenChange={setLaunchOpen}
-        title="Run static application analysis"
-        description="REA inventories the artifact, parses selected sources, and returns real application relationships."
+        title={
+          isNative ? "Inspect native binary" : "Run static application analysis"
+        }
+        description={
+          isNative
+            ? "Use existing REA static analysis tools. The selected binary is never executed."
+            : "REA inventories the artifact, parses selected sources, and returns real application relationships."
+        }
       >
         <div className="launch-summary">
           <span>Target</span>
           <code>{project?.target}</code>
           <span>Provider</span>
           <strong>
-            REA static JavaScript analysis · no native decompiler required
+            {isNative
+              ? "REA native analysis · configured providers"
+              : "REA static JavaScript analysis · no native decompiler required"}
           </strong>
-          <span>Integrity policy</span>
-          <strong>Fail on integrity contradictions</strong>
+          <span>{isNative ? "Target execution" : "Integrity policy"}</span>
+          <strong>
+            {isNative
+              ? "Disabled · static REA operations"
+              : "Fail on integrity contradictions"}
+          </strong>
         </div>
-        {connection.data?.supports_source_paths && (
+        {isNative && (
+          <>
+            <label>
+              Native task
+              <select
+                value={nativeOperation}
+                onChange={(e) =>
+                  setNativeOperation(e.target.value as NativeOperation)
+                }
+              >
+                {Object.entries(nativeNames).map(([operation, name]) => (
+                  <option
+                    key={operation}
+                    value={operation}
+                    disabled={
+                      !connection.data?.native?.operations.find(
+                        (o) => o.operation === operation,
+                      )?.advertised
+                    }
+                  >
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Analysis provider
+              <select
+                value={nativeProvider}
+                onChange={(e) => setNativeProvider(e.target.value)}
+              >
+                <option value="">
+                  REA default (preserves configured preference)
+                </option>
+                <option value="auto">Automatic selection</option>
+                {connection.data?.native?.providers.map((p) => (
+                  <option key={p.id} value={p.id} disabled={!p.available}>
+                    {p.name}
+                    {p.available ? "" : " — unavailable"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {[
+              "function",
+              "instructions",
+              "references",
+              "procedures",
+              "instruction",
+            ].includes(nativeOperation) && (
+              <label>
+                {nativeOperation === "procedures"
+                  ? "Function name search (literal)"
+                  : nativeOperation === "references" ||
+                      nativeOperation === "instruction"
+                    ? "Exact provider address"
+                    : "Function name or provider address"}
+                <input
+                  value={nativeQuery}
+                  maxLength={4096}
+                  onChange={(e) => setNativeQuery(e.target.value)}
+                  placeholder={
+                    nativeOperation === "references" ||
+                    nativeOperation === "instruction"
+                      ? "0x10114c"
+                      : "main"
+                  }
+                />
+              </label>
+            )}
+            <p className="muted">
+              Queries reuse the open REA session while the target and provider
+              stay the same. Each task saves its original Evidence. Studio
+              closes the session on exit, connection changes and task failure.
+              Unavailable operations retain REA's diagnostic; Studio does not
+              substitute a provider.
+            </p>
+          </>
+        )}
+        {!isNative && connection.data?.supports_source_paths && (
           <label>
             Exact source paths (optional, one per line)
             <textarea
@@ -1336,26 +1621,62 @@ export default function App() {
           </label>
         )}
         <p className="muted">
-          {connection.data?.supports_source_paths
-            ? "Leave empty to analyze the complete application. Selection reduces source parsing; unselected relationships remain unknown."
-            : "This installation supports complete application analysis. Source selection is unavailable in its advertised contract."}{" "}
+          {isNative
+            ? "Native coverage and pseudocode limitations come from REA Evidence."
+            : connection.data?.supports_source_paths
+              ? "Leave empty to analyze the complete application. Selection reduces source parsing; unselected relationships remain unknown."
+              : "This installation supports complete application analysis. Source selection is unavailable in its advertised contract."}{" "}
           No progress percentage is estimated.
         </p>
         <div className="modal-actions">
           <Button onClick={() => setLaunchOpen(false)}>Cancel</Button>
           <Button
             variant="primary"
-            disabled={!project || !isConnected || busy || !!running}
+            disabled={
+              !project ||
+              !canRun ||
+              busy ||
+              !!running ||
+              activeTask.data === true ||
+              (isNative &&
+                (!nativeOperationSupported ||
+                  ([
+                    "function",
+                    "instructions",
+                    "references",
+                    "procedures",
+                    "instruction",
+                  ].includes(nativeOperation) &&
+                    !nativeQuery.length)))
+            }
             onClick={() => {
               void action(async () => {
                 const id = await api.start(
                   project!.id,
-                  (connection.data?.supports_source_paths ? sourcePaths : "")
+                  (!isNative && connection.data?.supports_source_paths
+                    ? sourcePaths
+                    : ""
+                  )
                     .split("\n")
                     .map((s) => (s.endsWith("\r") ? s.slice(0, -1) : s))
                     .filter((s) => s.length > 0),
+                  isNative
+                    ? {
+                        operation: nativeOperation,
+                        query: nativeQuery,
+                        ...(nativeProvider
+                          ? { provider_id: nativeProvider }
+                          : {}),
+                      }
+                    : undefined,
                 );
-                ws.set({ job: id, console: true });
+                ws.set({
+                  job: id,
+                  console: true,
+                  ...(isNative
+                    ? { selected: "", view: "findings" as const }
+                    : {}),
+                });
                 setLaunchOpen(false);
                 await query.invalidateQueries({ queryKey: ["jobs"] });
               });

@@ -1,18 +1,61 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn } from "node:child_process";
-import { readFile, writeFile, stat } from "node:fs/promises";
+
+import { analyzeJavascript } from "./javascript";
+import { runAgent, detectAgent } from "./agent";
 import { createInterface } from "node:readline";
 import { isAbsolute } from "node:path";
-import { normalizeBundle, supportedVersion } from "./normalize";
+import { supportedVersion } from "./normalize";
+import {
+  analyzeNative,
+  availability,
+  nativeDiscovery,
+  NativeSession,
+} from "./native";
 
-const MAX_BUNDLE = 64 * 1024 * 1024;
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-const controller = new AbortController();
+let controller = new AbortController();
+let retained:
+  | {
+      node: string;
+      rea: string;
+      version: string;
+      native: ReturnType<typeof nativeDiscovery>;
+      session: NativeSession;
+    }
+  | undefined;
+async function shutdown() {
+  if (!retained) return;
+  const owned = retained;
+  let failure: unknown;
+  try {
+    await owned.session.close();
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await owned.session.client.close();
+  } catch (error) {
+    failure = new Error(
+      `${failure ? String(failure) + "; " : ""}Transport cleanup remains unknown: ${String(error)}`,
+    );
+  }
+  if (failure) {
+    process.exitCode = 1;
+    throw failure;
+  }
+  retained = undefined;
+}
 let running = false;
 let finished = false;
 lines.on("close", () => {
   if (running && !finished) controller.abort();
+  else
+    void shutdown().catch((error) => {
+      process.stderr.write(String(error));
+      process.exitCode = 1;
+    });
 });
 const emit = (type: string, value: unknown) =>
   process.stdout.write(JSON.stringify({ type, value }) + "\n");
@@ -27,20 +70,38 @@ lines.on("line", (line) => {
       );
       return;
     }
-    if (running) throw new Error("A bridge accepts one request");
+    if (running) throw new Error("A bridge accepts one active request");
     running = true;
-    void run(request)
+    finished = false;
+    controller = new AbortController();
+    let keep = request.keep_alive === true;
+    void (
+      request.action === "shutdown"
+        ? shutdown().then(() => ({ closed: true }))
+        : run(request)
+    )
       .then((value) => emit("result", value))
-      .catch((error) =>
+      .catch(async (error) => {
+        keep = false;
+        let cleanup = "";
+        try {
+          await shutdown();
+        } catch (e) {
+          cleanup = `; ${String(e)}`;
+        }
         emit("error", {
-          message: error instanceof Error ? error.message : String(error),
+          message:
+            (error instanceof Error ? error.message : String(error)) + cleanup,
           cancellation_requested: controller.signal.aborted,
-        }),
-      )
+        });
+      })
       .finally(() => {
         finished = true;
-        lines.close();
-        process.stdin.destroy();
+        running = false;
+        if (!keep) {
+          lines.close();
+          process.stdin.destroy();
+        }
       });
   } catch (error) {
     emit("error", { message: String(error) });
@@ -96,6 +157,25 @@ async function run(request: Record<string, unknown>) {
     throw new Error(
       "Choose absolute paths to the trusted Node executable and REA scripts/rea.mjs in Connection settings.",
     );
+  if (request.action === "detect_agent") return detectAgent(request);
+  if (retained) {
+    if (
+      request.action === "analyze_native" &&
+      request.keep_alive === true &&
+      retained.node === node &&
+      retained.rea === rea
+    )
+      return analyzeNative(
+        retained.session.client,
+        request,
+        controller.signal,
+        emit,
+        retained.version,
+        retained.native,
+        retained.session,
+      );
+    await shutdown();
+  }
   let version: string | null = null;
   let cliAvailable = false;
   let mcpAvailable = false;
@@ -160,16 +240,23 @@ async function run(request: Record<string, unknown>) {
     }[] = [];
     let cursor: string | undefined;
     const cursors = new Set<string>();
+    const catalogNames = new Set<string>();
     do {
       const page = await client.listTools(cursor ? { cursor } : {}, {
         timeout: 120000,
       });
-      for (const tool of page.tools)
+      for (const tool of page.tools) {
+        if (catalogNames.has(tool.name))
+          throw new Error(
+            `REA advertised duplicate tool identity: ${tool.name}`,
+          );
+        catalogNames.add(tool.name);
         tools.push({
           name: tool.name,
           inputSchema: tool.inputSchema,
           ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
         });
+      }
       cursor = page.nextCursor;
       if (cursor && cursors.has(cursor))
         throw new Error("REA repeated a catalog cursor");
@@ -196,9 +283,6 @@ async function run(request: Record<string, unknown>) {
       !!properties?.input_path &&
       !!properties?.detail &&
       !!properties?.integrity_policy;
-    let availability:
-      | { available?: boolean; reason?: string; remediation?: string | null }
-      | undefined;
     let session: unknown = null;
     if (names.has("binary_session")) {
       const status = await client.callTool(
@@ -211,138 +295,105 @@ async function run(request: Record<string, unknown>) {
       );
       if (status.isError) throw new Error(JSON.stringify(status.content));
       session = status.structuredContent;
-      const statusObject = (
-        session as { result?: { tool_availability?: unknown } }
-      ).result;
-      const inventory = statusObject?.tool_availability;
-      // The published 6.4.0 lifecycle result uses individual entries; the researched
-      // source checkout uses the documented compact inventory. Parse once here.
-      if (Array.isArray(inventory))
-        availability = inventory.find(
-          (g) => g?.name === "analyze_javascript_application",
-        );
-      else if (
-        inventory &&
-        typeof inventory === "object" &&
-        "groups" in inventory &&
-        Array.isArray(inventory.groups)
-      )
-        availability = inventory.groups.find(
-          (g) =>
-            Array.isArray(g?.names) &&
-            g.names.includes("analyze_javascript_application"),
-        );
     }
-    const canAnalyze = contractsMatch && availability?.available === true;
+    const applicationStatus = availability(session).find(
+      (s) => s.name === "analyze_javascript_application",
+    );
+    const native = nativeDiscovery(session, tools);
+    const canAnalyze = contractsMatch && applicationStatus?.available === true;
     const supportsSourcePaths = !!properties?.source_paths;
-    const readinessMessage = !contractsMatch
-      ? "The live tool catalog does not provide the required Studio contracts."
-      : !canAnalyze
-        ? `Static analysis unavailable: ${availability?.reason ?? "availability unknown"}. ${availability?.remediation ?? "Inspect actual provider status below."}`
-        : "CLI, MCP, and static-analysis availability checks passed.";
+    const readinessMessage = [
+      "CLI and MCP checks passed.",
+      canAnalyze
+        ? "JavaScript analysis is available."
+        : `JavaScript analysis unavailable: ${contractsMatch ? (applicationStatus?.reason ?? "availability unknown") : "required contracts missing"}. ${applicationStatus?.remediation ?? ""}`,
+      native.can_open
+        ? "Native opening is available; provider and target support are checked when opening."
+        : "Native lifecycle contracts or availability are missing.",
+    ].join(" ");
     if (request.action === "detect")
       return {
-        state: canAnalyze
-          ? "connected"
-          : contractsMatch
-            ? "missing_dependency"
-            : "incompatible",
+        state:
+          canAnalyze || native.can_open
+            ? "connected"
+            : contractsMatch
+              ? "missing_dependency"
+              : "incompatible",
         version,
         cli: true,
         mcp: true,
         can_analyze: canAnalyze,
         supports_source_paths: supportsSourcePaths,
+        native,
         tools,
         providers: { cli: providers, mcp: session },
         message: readinessMessage,
       };
+    if (request.action === "agent") {
+      const session = new NativeSession(client);
+      try {
+        return await runAgent(
+          request,
+          controller.signal,
+          emit,
+          async (task) => {
+            if (request.workflow === "native")
+              return analyzeNative(
+                client!,
+                task,
+                controller.signal,
+                emit,
+                version!,
+                native,
+                session,
+              );
+            if (!canAnalyze)
+              throw new Error(
+                "JavaScript analysis is unavailable for this connection",
+              );
+            return analyzeJavascript(
+              client!,
+              task,
+              controller.signal,
+              emit,
+              version!,
+              supportsSourcePaths,
+            );
+          },
+        );
+      } finally {
+        try {
+          await session.close();
+        } catch (error) {
+          process.exitCode = 1;
+          throw error;
+        }
+      }
+    }
+    if (request.action === "analyze_native") {
+      const session = new NativeSession(client);
+      if (request.keep_alive === true)
+        retained = { node, rea, version, native, session };
+      return await analyzeNative(
+        client,
+        request,
+        controller.signal,
+        emit,
+        version,
+        native,
+        session,
+      );
+    }
     if (request.action !== "analyze" || !canAnalyze)
       throw new Error("Analysis is unavailable for this connection");
-    const inputPath = String(request.target ?? "");
-    const output = String(request.output ?? "");
-    const projection = String(request.projection ?? "");
-    if (![inputPath, output, projection].every(isAbsolute))
-      throw new Error("Analysis paths must be absolute");
-    const sourcePaths = request.source_paths;
-    if (
-      Array.isArray(sourcePaths) &&
-      sourcePaths.length &&
-      !supportsSourcePaths
-    )
-      throw new Error(
-        "Source path selection is unavailable in this installation’s advertised analysis contract. Run full analysis or connect a REA build that advertises source_paths.",
-      );
-    if (
-      sourcePaths !== undefined &&
-      (!Array.isArray(sourcePaths) ||
-        sourcePaths.some((p) => typeof p !== "string" || p.includes("\0")))
-    )
-      throw new Error("Invalid exact source path selection");
-    emit(
-      "progress",
-      `REA ${version}: static analysis started. Imported code is not executed.`,
+    return analyzeJavascript(
+      client,
+      request,
+      controller.signal,
+      emit,
+      version,
+      supportsSourcePaths,
     );
-    const reply = await client.callTool(
-      {
-        name: "analyze_javascript_application",
-        arguments: {
-          input_path: inputPath,
-          format: "auto",
-          integrity_policy: "fail",
-          detail: "summary",
-          ...(Array.isArray(sourcePaths) && sourcePaths.length
-            ? { source_paths: sourcePaths }
-            : {}),
-        },
-      },
-      undefined,
-      {
-        signal: controller.signal,
-        timeout: 30 * 60 * 1000,
-        resetTimeoutOnProgress: true,
-        onprogress: (update) =>
-          emit(
-            "progress",
-            update.message ?? `Progress observation ${update.progress}`,
-          ),
-      },
-    );
-    if (reply.isError) throw new Error(JSON.stringify(reply.content));
-    const summary = reply.structuredContent as
-      | { normalized_result?: { parent_evidence_id?: unknown } }
-      | undefined;
-    const evidenceId = summary?.normalized_result?.parent_evidence_id;
-    if (typeof evidenceId !== "string")
-      throw new Error(
-        "REA summary omitted the full-analysis Evidence reference",
-      );
-    controller.signal.throwIfAborted();
-    emit(
-      "progress",
-      "Exporting complete original Evidence before closing the REA session.",
-    );
-    const receipt = await client.callTool(
-      {
-        name: "export_evidence_bundle",
-        arguments: { path: output, overwrite: false },
-      },
-      undefined,
-      { timeout: 120000 },
-    );
-    if (receipt.isError) throw new Error(JSON.stringify(receipt.content));
-    if ((await stat(output)).size > MAX_BUNDLE)
-      throw new Error(
-        "Complete Evidence was saved, but exceeds the 64 MiB Studio indexing limit. Use REA source selection; the original export remains on disk.",
-      );
-    const normalized = normalizeBundle(
-      JSON.parse(await readFile(output, "utf8")),
-      evidenceId,
-    );
-    await writeFile(projection, JSON.stringify(normalized), {
-      flag: "wx",
-      mode: 0o600,
-    });
-    return { version, evidence_id: evidenceId, projection, raw_path: output };
   } catch (error) {
     if (request.action !== "detect") throw error;
     return {
@@ -356,6 +407,6 @@ async function run(request: Record<string, unknown>) {
       message: error instanceof Error ? error.message : String(error),
     };
   } finally {
-    if (client) await client.close();
+    if (client && retained?.session.client !== client) await client.close();
   }
 }

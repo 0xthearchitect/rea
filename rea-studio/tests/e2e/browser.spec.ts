@@ -25,7 +25,7 @@ test("browser preview reports unavailable native integration and preserves layou
     .getByRole("button", { name: "Agent workspace", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "Agent integration is not configured" }),
+    page.getByRole("heading", { name: "Desktop required for agents" }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Toggle color theme" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");

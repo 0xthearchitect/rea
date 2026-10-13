@@ -3,6 +3,7 @@
   --font-sans: "Segoe UI", Inter, system-ui, sans-serif;
 }
 :root {
+  color-scheme: dark;
   font-family: "Segoe UI", Inter, system-ui, sans-serif;
   font-size: 12px;
   color: var(--text);
@@ -1290,4 +1291,64 @@ details pre {
   * {
     transition: none !important;
   }
+}
+.native-view {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  overflow: auto;
+  padding: 24px;
+}
+.native-view h2 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 20px;
+}
+.native-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+.native-fields > div {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 14px;
+}
+.native-fields dt {
+  color: var(--muted);
+}
+.native-fields dd {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.native-section {
+  margin-top: 24px;
+}
+.native-record {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.native-section h3 {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.native-editor {
+  height: 330px;
+  border: 1px solid var(--border);
+}
+.native-section table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+.native-section th,
+.native-section td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

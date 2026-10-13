@@ -24,12 +24,64 @@ export interface Connection {
   message: string;
   tools: { name: string; inputSchema: Json; outputSchema?: Json }[];
   providers: Json;
+  native?: {
+    can_open: boolean;
+    providers: {
+      id: string;
+      name: string;
+      version: string | null;
+      available: boolean | null;
+      reason: string | null;
+    }[];
+    operations: {
+      operation: NativeOperation;
+      name: string;
+      advertised: boolean;
+      available: boolean | null;
+      reason: string | null;
+    }[];
+  };
+}
+export type NativeOperation =
+  | "overview"
+  | "procedures"
+  | "strings"
+  | "function"
+  | "instructions"
+  | "references"
+  | "instruction";
+export interface NativeRequest {
+  operation: NativeOperation;
+  provider_id?: string;
+  query: string;
+}
+export interface NativeView {
+  title: string;
+  record?: {
+    confidence: string | null;
+    authority: string | null;
+    provider: string | null;
+  };
+  procedure?: string;
+  provider_selection?: { provider_id?: string };
+  actions?: { label: string; operation: NativeOperation; query: string }[];
+  limitations?: string[];
+  fields: { label: string; value: Json }[];
+  code?: string;
+  assembly?: string[];
+  tables?: {
+    title: string;
+    columns: string[];
+    rows: Json[][];
+    links?: { operation: NativeOperation; query: string }[];
+  }[];
 }
 export interface Project {
   id: string;
   name: string;
   target: string;
   created_at: number;
+  workflow: "javascript" | "native";
 }
 export interface Job {
   id: string;
@@ -71,6 +123,7 @@ export interface Graph {
   limited: boolean;
 }
 export interface Evidence {
+  native: NativeView | null;
   inspection: {
     label: string | null;
     kind: string | null;
@@ -93,4 +146,41 @@ export interface Activity {
   job_id: string;
   message: string;
   at: number;
+}
+
+export interface AgentSettings {
+  executable: string;
+  model: string;
+}
+export interface AgentConnection {
+  available: boolean;
+  authenticated: boolean;
+  message: string;
+}
+export interface AgentConversation {
+  id: string;
+  project_id: string;
+  created_at: number;
+}
+export interface AgentTurn {
+  id: string;
+  question: string;
+  answer: string;
+  context: Json;
+  state: string;
+  model: string | null;
+  model_provider: string | null;
+  usage: Json;
+  created_at: number;
+  finished_at: number | null;
+  message: string;
+  activity: Activity[];
+  evidence: { job_id: string; evidence_id: string }[];
+  authority: "analyst-inference";
+}
+export interface AgentTurnPage {
+  items: AgentTurn[];
+  total: number;
+  offset: number;
+  next_offset: number | null;
 }

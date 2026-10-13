@@ -95,6 +95,11 @@ mod tests {
                 .code,
             "target_changed"
         );
+        std::fs::write(dir.path().join("x.js"), b"export const x = 2;").unwrap();
+        assert_eq!(
+            verified_source(dir.path(), "x.js", &hash).unwrap_err().code,
+            "target_changed"
+        );
     }
     #[test]
     fn bounded_reads_fail_without_truncating() {

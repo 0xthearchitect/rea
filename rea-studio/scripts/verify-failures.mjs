@@ -1,10 +1,15 @@
 import { spawn } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile } from "node:fs/promises";
+import { resolve, isAbsolute } from "node:path";
+import { createHash } from "node:crypto";
 const root = resolve(".local", `failure-verification-${Date.now()}`);
 await mkdir(root, { recursive: true });
 const rea = resolve(process.env.REA_STUDIO_REA_ENTRY ?? "../scripts/rea.mjs");
-async function check(request, cancel = false) {
+async function check(
+  request,
+  cancel = false,
+  phase = "static analysis started",
+) {
   const child = spawn(
     process.execPath,
     [resolve("src-tauri/resources/bridge.mjs")],
@@ -25,7 +30,7 @@ async function check(request, cancel = false) {
         cancel &&
         !cancellationSent &&
         event.type === "progress" &&
-        event.value.includes("static analysis started")
+        event.value.includes(phase)
       ) {
         cancellationSent = true;
         child.stdin.write('{"action":"cancel"}\n');
@@ -95,3 +100,68 @@ if (
 console.log(
   "Cancellation request remains distinct from success; upstream cleanup unknown: verified",
 );
+const nativeTarget = process.env.STUDIO_NATIVE_TARGET;
+if (nativeTarget) {
+  if (!isAbsolute(nativeTarget))
+    throw new Error(
+      "STUDIO_NATIVE_TARGET requires the exact absolute fixture path",
+    );
+  const digest = async () =>
+    createHash("sha256")
+      .update(await readFile(nativeTarget))
+      .digest("hex");
+  const original = await digest();
+  const native = (
+    label,
+    operation,
+    query,
+    provider_id = process.env.STUDIO_NATIVE_PROVIDER ?? "ghidra",
+  ) => ({
+    action: "analyze_native",
+    target: nativeTarget,
+    native_request: { operation, query, provider_id },
+    output: resolve(root, `${label}-evidence.json`),
+    projection: resolve(root, `${label}-projection.json`),
+  });
+  const unknownProvider = await check(
+    native("unknown-provider", "overview", "", "studio-missing-provider"),
+  );
+  if (
+    !unknownProvider.some(
+      (e) =>
+        e.type === "error" &&
+        e.value.message.includes("studio-missing-provider"),
+    ) ||
+    unknownProvider.some((e) => e.type === "result")
+  )
+    throw new Error("Explicit unknown provider was not preserved and rejected");
+  const missingFunction = await check(
+    native("missing-function", "function", "studio_missing_function"),
+  );
+  if (
+    !missingFunction.some((e) => e.type === "error") ||
+    missingFunction.some((e) => e.type === "result")
+  )
+    throw new Error("Missing native function became a successful result");
+  const interrupted = await check(
+    native("native-cancelled", "overview", ""),
+    true,
+    ": binary_overview",
+  );
+  if (
+    !interrupted.some(
+      (e) => e.type === "error" && e.value.cancellation_requested === true,
+    ) ||
+    interrupted.some((e) => e.type === "result")
+  )
+    throw new Error("Native cancellation became a successful analysis");
+  if ((await digest()) !== original)
+    throw new Error("Native fixture bytes changed during failure verification");
+  console.log(
+    "Real native unknown-provider, missing-function and cancellation boundaries: verified; target unchanged",
+  );
+} else {
+  console.log(
+    "Native failure coverage skipped: set STUDIO_NATIVE_TARGET to a self-owned native fixture",
+  );
+}

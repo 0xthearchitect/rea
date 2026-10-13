@@ -7,3 +7,5 @@ src-tauri/icons/
 playwright-report/
 test-results/
 .local/
+# Local design review artifacts; the production UI lives under src/.
+/design/
