@@ -35,7 +35,15 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 it
   .runIf(process.platform === "linux")
-  .each(["capture", "tool", "limiter", "kernel"])(
+  .each([
+    "capture",
+    "tool",
+    "limiter",
+    "kernel",
+    "field-tool",
+    "field-limiter",
+    "field-kernel",
+  ])(
   "retains failed %s descriptors and retries them before further acquisition and shutdown",
   async (member) => {
     const directory = await createTestTempDirectory("rea-capture-descriptor-");
@@ -67,12 +75,17 @@ it
       },
       () => PrivateRuntimeRoot.create({ parent: directory }),
     );
+    const discovery = member.startsWith("field-");
+    const resource = discovery ? member.slice(6) : member;
+    const operation = discovery
+      ? "inspect_packet_fields"
+      : "inspect_packet_capture";
     cleanup.path =
-      member === "capture"
+      resource === "capture"
         ? path
-        : member === "tool"
+        : resource === "tool"
           ? command
-          : member === "limiter"
+          : resource === "limiter"
             ? limiter
             : "/proc/self/limits";
     cleanup.denied = true;
@@ -84,21 +97,31 @@ it
       cleanup.path = "";
     });
     const service = new PacketCaptureService(provider);
-    const first = await service.inspect({ path, fields: ["frame.number"] });
+    const first = discovery
+      ? await service.inspectFields({ query: "usb" })
+      : await service.inspect({ path, fields: ["frame.number"] });
     expect(first).toMatchObject({
       ok: false,
-      error: { cleanupIncomplete: true, cleanupResources: [cleanup.path] },
+      error: {
+        cleanupIncomplete: true,
+        cleanupResources: [cleanup.path],
+        operation,
+      },
     });
     expect(cleanup.handles).toHaveLength(1);
     expect(cleanup.handles[0]?.fd).toBeGreaterThanOrEqual(0);
     const launchCount = launches;
     expect(
       await service.inspect({ path, fields: ["frame.number"] }),
-    ).toMatchObject({ ok: false, error: { cleanupIncomplete: true } });
+    ).toMatchObject({
+      ok: false,
+      error: { cleanupIncomplete: true, operation },
+    });
     expect(cleanup.handles).toHaveLength(1);
     expect(launches).toBe(launchCount);
     await expect(provider.close()).rejects.toMatchObject({
       cleanupIncomplete: true,
+      operation,
     });
     cleanup.denied = false;
     await provider.close();
