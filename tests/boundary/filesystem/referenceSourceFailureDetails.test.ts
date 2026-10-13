@@ -132,7 +132,9 @@ describe("reference import native entry failure details", () => {
       imported.value.entries.find(({ path }) => path === "main.ts"),
     ).toMatchObject({ kind: "file", content_state: "hashed", limitations: [] });
   });
+});
 
+describe("reference import paths beyond the platform limit", () => {
   it.skipIf(process.platform === "win32")(
     "reports an entry beyond the absolute path limit as an I/O failure",
     async () => {
@@ -171,7 +173,19 @@ describe("reference import native entry failure details", () => {
           message: expect.stringContaining("ENAMETOOLONG"),
         });
         const imported = await importTree(root);
-        expect(imported.ok).toBe(true);
+        if (!imported.ok) throw new Error(imported.error.message);
+        expect(imported.value.entries).toContainEqual(
+          expect.objectContaining({
+            path: "kept.txt",
+            content_state: "hashed",
+          }),
+        );
+        const deep = imported.value.entries.find(
+          (entry) => entry.path === failed?.path,
+        );
+        expect(deep?.limitations.join(" ")).toContain(
+          failed?.status === "failed" ? failed.message : "missing failure",
+        );
       } finally {
         await deepTree("remove");
       }
