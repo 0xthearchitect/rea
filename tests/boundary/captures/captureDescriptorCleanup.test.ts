@@ -1,3 +1,7 @@
+import {
+  descriptorFailurePath,
+  expectRetainedDescriptor,
+} from "../../fixtures/descriptorCloseFailure.js";
 import { expect, it, onTestFinished, vi } from "vitest";
 import { writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -15,22 +19,9 @@ const cleanup = vi.hoisted(() => ({
 }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const filesystem = await importOriginal<typeof import("node:fs/promises")>();
-  return {
-    ...filesystem,
-    open: async (...args: Parameters<typeof filesystem.open>) => {
-      const handle = await filesystem.open(...args);
-      if (args[0] === cleanup.path) {
-        cleanup.handles.push(handle);
-        const close = handle.close.bind(handle);
-        handle.close = async () => {
-          if (cleanup.denied && handle.fd >= 0)
-            throw new Error("Descriptor close deliberately denied");
-          await close();
-        };
-      }
-      return handle;
-    },
-  };
+  const { withDescriptorCloseFailure } =
+    await import("../../fixtures/descriptorCloseFailure.js");
+  return withDescriptorCloseFailure(filesystem, cleanup);
 });
 
 it
@@ -80,14 +71,11 @@ it
     const operation = discovery
       ? "inspect_packet_fields"
       : "inspect_packet_capture";
-    cleanup.path =
-      resource === "capture"
-        ? path
-        : resource === "tool"
-          ? command
-          : resource === "limiter"
-            ? limiter
-            : "/proc/self/limits";
+    cleanup.path = descriptorFailurePath(resource, {
+      capture: path,
+      tool: command,
+      limiter,
+    });
     cleanup.denied = true;
     cleanup.handles = [];
     onTestFinished(async () => {
@@ -100,16 +88,7 @@ it
     const first = discovery
       ? await service.inspectFields({ query: "usb" })
       : await service.inspect({ path, fields: ["frame.number"] });
-    expect(first).toMatchObject({
-      ok: false,
-      error: {
-        cleanupIncomplete: true,
-        cleanupResources: [cleanup.path],
-        operation,
-      },
-    });
-    expect(cleanup.handles).toHaveLength(1);
-    expect(cleanup.handles[0]?.fd).toBeGreaterThanOrEqual(0);
+    expectRetainedDescriptor(first, cleanup, operation);
     const launchCount = launches;
     expect(
       await service.inspect({ path, fields: ["frame.number"] }),
@@ -145,7 +124,6 @@ it
     });
     cleanup.denied = false;
     await provider.close();
-    expect(cleanup.handles[0]?.fd).toBe(-1);
     expect(cleanup.handles.every((handle) => handle.fd === -1)).toBe(true);
   },
 );
