@@ -323,20 +323,11 @@ it("rejects overlapping ZIP member data ranges through artifact inventory", asyn
   bytes.writeUInt32LE(firstLocalOffset, second + 42);
   await writeFile(path, bytes);
 
-  const target = await parseBinaryTarget(path);
-  if (!target.ok) throw target.error;
-  const result = await withArtifactClient(target.value, (client) =>
-    client.execute("inventory_artifact", {}),
+  await expectInventoryFailure(
+    path,
+    "format",
+    "ZIP archive is malformed: Overlapping entry found",
   );
-
-  expect(result).toMatchObject({
-    ok: false,
-    error: {
-      _tag: "ArtifactOperationError",
-      reason: "format",
-      detail: "ZIP archive is malformed: Overlapping entry found",
-    },
-  });
 });
 
 it("preserves encrypted-member and corrupt-CRC observations", async () => {
@@ -399,20 +390,11 @@ it("preserves encrypted-member and corrupt-CRC observations", async () => {
   bytes[dataOffset] = firstByte ^ 1;
   await writeFile(corruptPath, bytes);
 
-  const corruptTarget = await parseBinaryTarget(corruptPath);
-  if (!corruptTarget.ok) throw corruptTarget.error;
-  const corruptResult = await withArtifactClient(
-    corruptTarget.value,
-    (client) => client.execute("inventory_artifact", {}),
+  await expectInventoryFailure(
+    corruptPath,
+    "format",
+    "ZIP archive is malformed: Invalid compressed data",
   );
-  expect(corruptResult).toMatchObject({
-    ok: false,
-    error: {
-      _tag: "ArtifactOperationError",
-      reason: "format",
-      detail: "ZIP archive is malformed: Invalid compressed data",
-    },
-  });
 });
 
 it("rejects a truncated ZIP through artifact inventory", async () => {
@@ -420,20 +402,11 @@ it("rejects a truncated ZIP through artifact inventory", async () => {
   const path = join(root, "truncated.zip");
   await writeFile(path, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
 
-  const target = await parseBinaryTarget(path);
-  if (!target.ok) throw target.error;
-  const result = await withArtifactClient(target.value, (client) =>
-    client.execute("inventory_artifact", {}),
+  await expectInventoryFailure(
+    path,
+    "format",
+    "ZIP archive is malformed: File format is not recognized",
   );
-
-  expect(result).toMatchObject({
-    ok: false,
-    error: {
-      _tag: "ArtifactOperationError",
-      reason: "format",
-      detail: "ZIP archive is malformed: File format is not recognized",
-    },
-  });
 });
 
 it("reports an unsupported ZIP compression method as unavailable", async () => {
@@ -451,22 +424,29 @@ it("reports an unsupported ZIP compression method as unavailable", async () => {
   bytes.writeUInt16LE(14, centralHeader + 10);
   await writeFile(path, bytes);
 
+  await expectInventoryFailure(
+    path,
+    "unavailable",
+    "ZIP archive uses an unsupported feature: Compression method not supported",
+  );
+});
+
+/** Inventory one archive through the provider and expect a typed failure. */
+const expectInventoryFailure = async (
+  path: string,
+  reason: string,
+  detail: string,
+): Promise<void> => {
   const target = await parseBinaryTarget(path);
   if (!target.ok) throw target.error;
   const result = await withArtifactClient(target.value, (client) =>
     client.execute("inventory_artifact", {}),
   );
-
   expect(result).toMatchObject({
     ok: false,
-    error: {
-      _tag: "ArtifactOperationError",
-      reason: "unavailable",
-      detail:
-        "ZIP archive uses an unsupported feature: Compression method not supported",
-    },
+    error: { _tag: "ArtifactOperationError", reason, detail },
   });
-});
+};
 
 const writeSingleEntryZip = async (
   path: string,
