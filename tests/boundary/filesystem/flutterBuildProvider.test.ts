@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
@@ -1173,11 +1174,19 @@ it.each(["identify_flutter_build", "inspect_dart_aot"] as const)(
 
 it("names a missing or non-file APK selection instead of blaming package bytes", async () => {
   const root = await createTestTempDirectory("rea-flutter-selection-");
+  // A Unix socket cannot be opened at all, unlike a directory.
+  const socketPath = join(root, "s.sock");
+  const socket = createServer();
+  await new Promise<void>((resolve) => socket.listen(socketPath, resolve));
+  onTestFinished(
+    () => new Promise<void>((resolve) => socket.close(() => resolve())),
+  );
   const provider = new FlutterBuildProvider();
   onTestFinished(() => provider.close());
   for (const [path, message] of [
     [join(root, "absent.apk"), "Selected APK does not exist"],
     [root, "Selected APK is not a regular file"],
+    [socketPath, "Selected APK is not a regular file"],
   ] as const) {
     for (const operation of [
       "identify_flutter_build",

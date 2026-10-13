@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import type { BigIntStats, Stats } from "node:fs";
-import { lstat, open, type FileHandle } from "node:fs/promises";
+import { lstat, open, stat, type FileHandle } from "node:fs/promises";
 
 import { OwnedFileHandle } from "./OwnedFileHandle.js";
 
@@ -66,7 +66,9 @@ export const openRegularFile = async (
       (constants.O_NONBLOCK ?? 0) |
       (constants.O_NOCTTY ?? 0) |
       (options.symlinks === "reject" ? (constants.O_NOFOLLOW ?? 0) : 0),
-  );
+  ).catch(async (cause: unknown) => {
+    throw (await nonRegularOpenFailure(path, options.symlinks, cause)) ?? cause;
+  });
   const owner = new OwnedFileHandle(handle);
   try {
     options.signal?.throwIfAborted();
@@ -93,6 +95,26 @@ export const openRegularFile = async (
     }
     throw cause;
   }
+};
+
+/**
+ * Some non-regular files cannot be opened at all: a Unix socket fails with
+ * ENXIO on Linux and EOPNOTSUPP on macOS. Classify such a failure by the
+ * path's own metadata rather than by platform error codes.
+ */
+const nonRegularOpenFailure = async (
+  path: string,
+  symlinks: "follow" | "reject",
+  cause: unknown,
+): Promise<NonRegularFileReadError | undefined> => {
+  // A rejected symlink keeps its O_NOFOLLOW failure.
+  if (cause instanceof Error && "code" in cause && cause.code === "ELOOP")
+    return undefined;
+  const metadata = await (symlinks === "reject" ? lstat : stat)(path).catch(
+    () => undefined,
+  );
+  if (metadata === undefined || metadata.isFile()) return undefined;
+  return new NonRegularFileReadError(path, metadata.isDirectory());
 };
 
 /** Compare one regular file's identity and mutable metadata across a read. */
