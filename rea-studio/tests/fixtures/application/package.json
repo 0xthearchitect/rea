@@ -1,0 +1,7 @@
+{
+  "name": "studio-owned-analysis-sample",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "main.js",
+  "license": "MIT"
+}

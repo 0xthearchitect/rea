@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Studio main window. No shell, network, or unrestricted filesystem plugins.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-close"]
+}
