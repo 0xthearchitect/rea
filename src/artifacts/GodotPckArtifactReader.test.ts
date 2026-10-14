@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { text } from "node:stream/consumers";
 
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
+import { openRegularFile } from "../filesystem/RegularFile.js";
 
 import type { ArtifactEntry } from "./ArtifactReader.js";
 import { GodotPckArtifactReader } from "./GodotPckArtifactReader.js";
@@ -218,6 +219,11 @@ describe("GodotPckArtifactReader", () => {
     ],
     ["bytes without a pack", Buffer.from("not a godot pack at all"), "format"],
     [
+      "a member path longer than PATH_MAX",
+      buildPck(3, [{ path: "a".repeat(4097), data: "" }]),
+      "limit",
+    ],
+    [
       "a trailer pointing outside the file",
       Buffer.concat([
         Buffer.from("engine"),
@@ -230,5 +236,67 @@ describe("GodotPckArtifactReader", () => {
     await withReader(bytes, async (reader) => {
       await expect(list(reader)).rejects.toMatchObject({ reason });
     });
+  });
+});
+
+describe("GodotPckArtifactReader member streams", () => {
+  it("types cancellation during a member read instead of crashing", async () => {
+    const data = "x".repeat(4 * 1024 * 1024);
+    await withReader(
+      buildPck(3, [{ path: "big.bin", data }]),
+      async (reader) => {
+        const [entry] = await list(reader);
+        if (entry === undefined) throw new Error("expected one entry");
+        const controller = new AbortController();
+        const stream = await reader.open(entry, controller.signal);
+        const chunks = stream[Symbol.asyncIterator]();
+        await chunks.next();
+        controller.abort();
+        await expect(chunks.next()).rejects.toMatchObject({
+          reason: "cancelled",
+        });
+      },
+    );
+  });
+
+  it("keeps the reader usable after a consumer abandons a member", async () => {
+    const data = "x".repeat(4 * 1024 * 1024);
+    await withReader(
+      buildPck(3, [{ path: "big.bin", data }]),
+      async (reader) => {
+        const [entry] = await list(reader);
+        if (entry === undefined) throw new Error("expected one entry");
+        const abandoned = await reader.open(entry);
+        await abandoned[Symbol.asyncIterator]().next();
+        abandoned.destroy();
+        expect((await text(await reader.open(entry))).length).toBe(data.length);
+      },
+    );
+  });
+
+  it("reads members from the admitted descriptor after the path is replaced", async () => {
+    const path = await writePck(buildPck(3, members));
+    const handle = await openRegularFile(path, { symlinks: "reject" });
+    try {
+      const replacement = join(dirname(path), "replacement");
+      await writeFile(
+        replacement,
+        buildPck(3, [{ path: "other.gd", data: "" }]),
+      );
+      await rename(replacement, path);
+      const reader = new GodotPckArtifactReader(path, {
+        handle,
+        initial: await handle.stat(),
+      });
+      const entries = await list(reader);
+      expect(entries.map(({ path: member }) => member)).toEqual([
+        "scenes/main.gd",
+        "project.binary",
+        "data/é.json",
+      ]);
+      await reader.close();
+    } finally {
+      await handle.close();
+    }
   });
 });

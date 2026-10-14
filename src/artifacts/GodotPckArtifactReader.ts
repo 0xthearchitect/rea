@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
-import { Readable, Transform } from "node:stream";
+import { Readable, Transform, pipeline } from "node:stream";
 
 import {
   ArtifactReaderFailure,
@@ -11,6 +11,7 @@ import {
 } from "./ArtifactReader.js";
 import { GODOT_PCK_MAGIC } from "../domain/godotPckFormat.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import { readFileHandleChunks } from "../filesystem/readFileHandleChunks.js";
 import {
   NonRegularFileReadError,
   RegularFileAdmissionFailure,
@@ -30,6 +31,13 @@ const SUPPORTED_FORMAT_VERSIONS = new Set([2, 3]);
 const MINIMUM_ENTRY_BYTES = 4 + 8 + 8 + 16 + 4;
 const TRAILER_BYTES = 8 + 4;
 const DIRECTORY_CHUNK_BYTES = 64 * 1024;
+/** Member paths are project file paths; 4096 bytes is Linux PATH_MAX. */
+const MAX_MEMBER_PATH_BYTES = 4096;
+/**
+ * Directory metadata is retained in memory for the reader's lifetime. A real
+ * 1.6 GB export with 3937 members has a 0.4 MiB directory.
+ */
+const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const PCK_UTF8_DECODER = new TextDecoder("utf-8", {
   fatal: true,
   ignoreBOM: true,
@@ -134,13 +142,21 @@ export class GodotPckArtifactReader implements ArtifactReader {
     const source =
       record.size === 0
         ? Readable.from([])
-        : handle.createReadStream({
+        : readFileHandleChunks(handle, {
             start: record.offset,
             end: record.offset + record.size - 1,
-            autoClose: false,
-            ...(signal === undefined ? {} : { signal }),
           });
-    return source.pipe(verifyMember(record));
+    const output = verifyMember(record, signal);
+    const onAbort = (): void => {
+      output.destroy(cancelled());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    output.once("close", () => signal?.removeEventListener("abort", onAbort));
+    // pipeline forwards source errors to `output` and destroys the source when
+    // the consumer closes `output` early. Positional reads never close the
+    // reader-owned handle, unlike a FileHandle read stream.
+    pipeline(source, output, () => undefined);
+    return output;
   }
 
   async close(): Promise<void> {
@@ -292,6 +308,11 @@ const readPckDirectory = async (
   for (let index = 0; index < header.fileCount; index += 1) {
     abortIfNeeded(signal);
     const pathBytes = await cursor.uint32();
+    if (pathBytes > MAX_MEMBER_PATH_BYTES)
+      throw new ArtifactReaderFailure(
+        "limit",
+        `Godot PCK member ${String(index)} declares a ${String(pathBytes)}-byte path, exceeding the ${String(MAX_MEMBER_PATH_BYTES)}-byte path limit`,
+      );
     // The path length is bounded by the bytes left in the pack before allocation.
     const rawPath = await cursor.bytes(pathBytes);
     const offset = await cursor.uint64();
@@ -347,6 +368,7 @@ const pckMemberPath = (raw: Buffer): string => {
 class PckCursor {
   #buffer: Buffer = Buffer.alloc(0);
   #bufferStart = 0;
+  #consumed = 0;
 
   constructor(
     private readonly handle: FileHandle,
@@ -357,6 +379,12 @@ class PckCursor {
   async bytes(length: number): Promise<Buffer> {
     if (length > this.end - this.position)
       throw formatFailure("directory entry exceeds the pack");
+    this.#consumed += length;
+    if (this.#consumed > MAX_DIRECTORY_BYTES)
+      throw new ArtifactReaderFailure(
+        "limit",
+        `Godot PCK directory exceeds the ${String(MAX_DIRECTORY_BYTES)}-byte metadata budget`,
+      );
     const offset = this.position - this.#bufferStart;
     if (offset < 0 || offset + length > this.#buffer.length) {
       this.#buffer = await readExact(
@@ -384,11 +412,18 @@ class PckCursor {
   }
 }
 
-const verifyMember = (record: GodotPckRecord): Transform => {
+const verifyMember = (
+  record: GodotPckRecord,
+  signal?: AbortSignal,
+): Transform => {
   const hash = createHash("md5");
   let bytes = 0;
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
+      if (signal?.aborted === true) {
+        callback(cancelled());
+        return;
+      }
       hash.update(chunk);
       bytes += chunk.length;
       callback(null, chunk);
@@ -470,10 +505,9 @@ const notRegular = (
     { cause },
   );
 
+const cancelled = (): ArtifactReaderFailure =>
+  new ArtifactReaderFailure("cancelled", "Godot PCK operation cancelled");
+
 const abortIfNeeded = (signal?: AbortSignal): void => {
-  if (signal?.aborted === true)
-    throw new ArtifactReaderFailure(
-      "cancelled",
-      "Godot PCK operation cancelled",
-    );
+  if (signal?.aborted === true) throw cancelled();
 };
