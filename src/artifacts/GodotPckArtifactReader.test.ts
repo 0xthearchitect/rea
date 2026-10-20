@@ -1,4 +1,10 @@
-import { createHash } from "node:crypto";
+import {
+  buildGodotPck,
+  embedGodotPck,
+  pckU32,
+  pckU64,
+  type GodotPckMember,
+} from "../../tests/fixtures/godotPck.js";
 import { rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { text } from "node:stream/consumers";
@@ -10,90 +16,6 @@ import { openRegularFile } from "../filesystem/RegularFile.js";
 
 import type { ArtifactEntry } from "./ArtifactReader.js";
 import { GodotPckArtifactReader } from "./GodotPckArtifactReader.js";
-
-interface Member {
-  readonly path: string;
-  readonly data: string;
-  readonly flags?: number;
-  readonly md5?: Buffer;
-  readonly size?: bigint;
-}
-
-const u32 = (value: number): Buffer => {
-  const bytes = Buffer.alloc(4);
-  bytes.writeUInt32LE(value);
-  return bytes;
-};
-const u64 = (value: bigint | number): Buffer => {
-  const bytes = Buffer.alloc(8);
-  bytes.writeBigUInt64LE(BigInt(value));
-  return bytes;
-};
-const pad4 = (bytes: Buffer): Buffer =>
-  Buffer.concat([bytes, Buffer.alloc((4 - (bytes.length % 4)) % 4)]);
-
-/**
- * Build a pack with the layout Godot's exporter writes (and GDRE Tools
- * reproduces): format 2 places the directory after a 96-byte header and
- * members after it; format 3 stores members first and a pack-relative
- * directory offset.
- */
-const buildPck = (
-  version: 2 | 3,
-  members: readonly Member[],
-  options: { packFlags?: number; fileCount?: number } = {},
-): Buffer => {
-  const data: Buffer[] = [];
-  const offsets: number[] = [];
-  let dataBytes = 0;
-  for (const member of members) {
-    offsets.push(dataBytes);
-    const bytes = pad4(Buffer.from(member.data));
-    data.push(bytes);
-    dataBytes += bytes.length;
-  }
-  const directory = Buffer.concat([
-    u32(options.fileCount ?? members.length),
-    ...members.flatMap((member, index) => {
-      const path = pad4(Buffer.from(member.path));
-      return [
-        u32(path.length),
-        path,
-        u64(offsets[index] ?? 0),
-        u64(member.size ?? BigInt(Buffer.byteLength(member.data))),
-        member.md5 ?? createHash("md5").update(member.data).digest(),
-        u32(member.flags ?? 0),
-      ];
-    }),
-  ]);
-  const headerBytes = 96;
-  const fileBase = version === 2 ? headerBytes + directory.length : headerBytes;
-  const header = Buffer.concat([
-    Buffer.from("GDPC"),
-    u32(version),
-    u32(4),
-    u32(6),
-    u32(1),
-    u32(options.packFlags ?? (version === 3 ? 2 : 0)),
-    u64(fileBase),
-    u64(version === 3 ? headerBytes + dataBytes : 0),
-  ]);
-  const paddedHeader = Buffer.concat([
-    header,
-    Buffer.alloc(headerBytes - header.length),
-  ]);
-  return version === 2
-    ? Buffer.concat([paddedHeader, directory, ...data])
-    : Buffer.concat([paddedHeader, ...data, directory]);
-};
-
-const embed = (pack: Buffer): Buffer =>
-  Buffer.concat([
-    Buffer.from("\x7fELF fake engine bytes"),
-    pack,
-    u64(pack.length),
-    Buffer.from("GDPC"),
-  ]);
 
 const writePck = async (bytes: Buffer): Promise<string> => {
   const path = join(await createTestTempDirectory("rea-godot-pck-"), "game");
@@ -121,7 +43,7 @@ const withReader = async <T>(
   }
 };
 
-const members: readonly Member[] = [
+const members: readonly GodotPckMember[] = [
   { path: "res://scenes/main.gd", data: "extends Node\n" },
   { path: "project.binary", data: "" },
   { path: "data/é.json", data: '{"session":"Session1"}' },
@@ -129,12 +51,14 @@ const members: readonly Member[] = [
 
 describe("GodotPckArtifactReader", () => {
   it.each([
-    ["format 3 standalone", buildPck(3, members), false],
-    ["format 2 standalone", buildPck(2, members), false],
-    ["format 3 embedded", embed(buildPck(3, members)), true],
+    ["format 4 standalone", buildGodotPck(4, members), false],
+    ["format 4 embedded", embedGodotPck(buildGodotPck(4, members)), true],
+    ["format 3 standalone", buildGodotPck(3, members), false],
+    ["format 2 standalone", buildGodotPck(2, members), false],
+    ["format 3 embedded", embedGodotPck(buildGodotPck(3, members)), true],
     [
       "format 2 embedded with relative file base",
-      embed(buildPck(2, members, { packFlags: 2 })),
+      embedGodotPck(buildGodotPck(2, members, { packFlags: 2 })),
       true,
     ],
   ])(
@@ -147,10 +71,12 @@ describe("GodotPckArtifactReader", () => {
           "project.binary",
           "data/é.json",
         ]);
-        expect(reader.header()).toMatchObject({
+        expect(reader.formatMetadata()).toMatchObject({
           embedded,
-          engineVersion: "4.6.1",
-          fileCount: 3,
+          engine_major: 4,
+          engine_minor: 6,
+          engine_patch: 1,
+          declared_file_count: 3,
         });
         const contents = await Promise.all(
           entries.map(async (entry) => text(await reader.open(entry))),
@@ -161,21 +87,25 @@ describe("GodotPckArtifactReader", () => {
     },
   );
 
-  it("fails closed when a member contradicts its declared MD5", async () => {
-    const bytes = buildPck(3, [
+  it("preserves declared MD5 for the shared inventory integrity verifier", async () => {
+    const bytes = buildGodotPck(3, [
       { path: "a.gd", data: "real", md5: Buffer.alloc(16, 1) },
     ]);
     await withReader(bytes, async (reader) => {
       const [entry] = await list(reader);
       if (entry === undefined) throw new Error("expected one entry");
-      await expect(text(await reader.open(entry))).rejects.toMatchObject({
-        reason: "integrity",
+      expect(entry.declaredIntegrity).toEqual({
+        algorithm: "md5",
+        digest: "01".repeat(16),
       });
+      expect(await text(await reader.open(entry))).toBe("real");
     });
   });
 
   it("reports encrypted members without reading them", async () => {
-    const bytes = buildPck(3, [{ path: "secret.gd", data: "x", flags: 1 }]);
+    const bytes = buildGodotPck(3, [
+      { path: "secret.gd", data: "x", flags: 1 },
+    ]);
     await withReader(bytes, async (reader) => {
       const [entry] = await list(reader);
       if (entry === undefined) throw new Error("expected one entry");
@@ -187,47 +117,79 @@ describe("GodotPckArtifactReader", () => {
   });
 
   it.each([
-    [
-      "an encrypted directory",
-      buildPck(3, members, { packFlags: 2 | 1 }),
-      "unavailable",
-    ],
-    [
-      "a sparse bundle",
-      buildPck(3, members, { packFlags: 2 | 4 }),
-      "unavailable",
-    ],
+    ["encrypted", 3],
+    ["sparse-bundle", 6],
+  ] as const)(
+    "preserves %s header facts with unknown directory coverage",
+    async (status, flags) => {
+      await withReader(
+        buildGodotPck(4, members, { packFlags: flags }),
+        async (reader) => {
+          const coverage: unknown[] = [];
+          const entries: ArtifactEntry[] = [];
+          for await (const entry of reader.entries(undefined, {
+            onCoverage: (value) => coverage.push(value),
+          }))
+            entries.push(entry);
+          expect(entries).toEqual([]);
+          expect(reader.formatMetadata()).toMatchObject({
+            directory_status: status,
+            declared_file_count: 3,
+            format_version: 4,
+          });
+          expect(coverage).toEqual([
+            expect.objectContaining({ status: "unknown" }),
+          ]);
+        },
+      );
+    },
+  );
+
+  it("admits a bounded virtual path independently of the host PATH_MAX", async () => {
+    const path = "a".repeat(4097);
+    await withReader(buildGodotPck(4, [{ path, data: "" }]), async (reader) => {
+      expect((await list(reader))[0]?.path).toBe(path);
+    });
+  });
+
+  it("rejects oversized encoded path metadata before allocating its declared bytes", async () => {
+    const bytes = buildGodotPck(2, members);
+    bytes.writeUInt32LE(0xffff_ffff, 100);
+    await withReader(bytes, async (reader) => {
+      await expect(list(reader)).rejects.toMatchObject({
+        reason: "limit",
+        boundary: "memory",
+      });
+    });
+  });
+
+  it.each([
     [
       "a patch removal entry",
-      buildPck(3, [{ path: "gone.gd", data: "", flags: 2 }]),
+      buildGodotPck(3, [{ path: "gone.gd", data: "", flags: 2 }]),
       "unavailable",
     ],
     [
       "a member count that cannot fit",
-      buildPck(3, members, { fileCount: 0xffff_ffff }),
+      buildGodotPck(3, members, { fileCount: 0xffff_ffff }),
       "format",
     ],
     [
       "member data beyond the pack",
-      buildPck(3, [{ path: "big.bin", data: "x", size: 1n << 40n }]),
+      buildGodotPck(3, [{ path: "big.bin", data: "x", size: 1n << 40n }]),
       "format",
     ],
     [
       "a Godot 3 format 1 pack",
-      Buffer.concat([Buffer.from("GDPC"), u32(1), Buffer.alloc(120)]),
+      Buffer.concat([Buffer.from("GDPC"), pckU32(1), Buffer.alloc(120)]),
       "unavailable",
     ],
     ["bytes without a pack", Buffer.from("not a godot pack at all"), "format"],
     [
-      "a member path longer than PATH_MAX",
-      buildPck(3, [{ path: "a".repeat(4097), data: "" }]),
-      "limit",
-    ],
-    [
       "a trailer pointing outside the file",
       Buffer.concat([
         Buffer.from("engine"),
-        u64(1n << 40n),
+        pckU64(1n << 40n),
         Buffer.from("GDPC"),
       ]),
       "format",
@@ -243,7 +205,7 @@ describe("GodotPckArtifactReader member streams", () => {
   it("types cancellation during a member read instead of crashing", async () => {
     const data = "x".repeat(4 * 1024 * 1024);
     await withReader(
-      buildPck(3, [{ path: "big.bin", data }]),
+      buildGodotPck(3, [{ path: "big.bin", data }]),
       async (reader) => {
         const [entry] = await list(reader);
         if (entry === undefined) throw new Error("expected one entry");
@@ -262,7 +224,7 @@ describe("GodotPckArtifactReader member streams", () => {
   it("keeps the reader usable after a consumer abandons a member", async () => {
     const data = "x".repeat(4 * 1024 * 1024);
     await withReader(
-      buildPck(3, [{ path: "big.bin", data }]),
+      buildGodotPck(3, [{ path: "big.bin", data }]),
       async (reader) => {
         const [entry] = await list(reader);
         if (entry === undefined) throw new Error("expected one entry");
@@ -275,13 +237,13 @@ describe("GodotPckArtifactReader member streams", () => {
   });
 
   it("reads members from the admitted descriptor after the path is replaced", async () => {
-    const path = await writePck(buildPck(3, members));
+    const path = await writePck(buildGodotPck(3, members));
     const handle = await openRegularFile(path, { symlinks: "reject" });
     try {
       const replacement = join(dirname(path), "replacement");
       await writeFile(
         replacement,
-        buildPck(3, [{ path: "other.gd", data: "" }]),
+        buildGodotPck(3, [{ path: "other.gd", data: "" }]),
       );
       await rename(replacement, path);
       const reader = new GodotPckArtifactReader(path, {

@@ -61,6 +61,11 @@ export const inventoryCoverage = (
         ...(isZipPackageFormat(reader.format)
           ? [ZIP_NON_ENTRY_LIMITATION]
           : []),
+        ...(reader.format === "godot-pck"
+          ? [
+              "PCK inventory establishes packaged bytes and metadata; scenes, binary resources, GDScript bytecode and runtime signal behavior were not decoded.",
+            ]
+          : []),
         ...traversal.limitations,
       ],
     };
@@ -79,13 +84,20 @@ export const inventoryCoverage = (
         "Universal Mach-O slices require the native macOS lipo adapter.",
       ],
     };
-  if (isZipPackageFormat(format) || format === "directory" || format === "asar")
+  if (
+    isZipPackageFormat(format) ||
+    format === "directory" ||
+    format === "asar" ||
+    format === "godot-pck"
+  )
     return {
       coverage: { scope: "container-entries", status: "unknown" },
       limitations: [`${format} child inventory reader is unavailable.`],
     };
   return {
     coverage: { scope: "root", status: "complete" },
-    limitations: ["Artifact has no child container entries."],
+    limitations: [
+      "Only the root artifact was inventoried; no supported child-container format was established.",
+    ],
   };
 };

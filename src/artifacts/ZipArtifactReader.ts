@@ -289,7 +289,7 @@ const projectZipEntry = (
     executable: entry.executable,
     encrypted: entry.encrypted,
     byteOffset: null,
-    declaredSha256: null,
+    declaredIntegrity: null,
     unpacked: false,
     limitations: [
       ...(kind === "symlink" ? ["Archive symlink target was not read."] : []),

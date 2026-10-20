@@ -1,400 +1,493 @@
-import { createHash } from "node:crypto";
+import { hashReadable } from "./ArtifactHash.js";
+import { artifactIntegrityDetails } from "../domain/artifactIntegrity.js";
+import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
+import { setImmediate } from "node:timers/promises";
 import { Readable, Transform, pipeline } from "node:stream";
-
 import {
   ArtifactReaderFailure,
   copyArtifactEntry,
   sameArtifactEntry,
   type ArtifactEntry,
   type ArtifactReader,
+  type ArtifactTraversalOptions,
 } from "./ArtifactReader.js";
-import { GODOT_PCK_MAGIC } from "../domain/godotPckFormat.js";
+import { ArtifactResourceScope } from "./ArtifactResourceScope.js";
+import { assertArtifactReadActive } from "./ArtifactFileOperation.js";
+import { locateGodotPck, readPckBytes } from "./GodotPckLocation.js";
+import type { GodotPckMetadata } from "../domain/artifactFormatMetadata.js";
+import { jsonValueByteLength } from "../domain/jsonValueByteLength.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { readFileHandleChunks } from "../filesystem/readFileHandleChunks.js";
 import {
   NonRegularFileReadError,
   RegularFileAdmissionFailure,
+  RegularFileOperationCancelled,
   openRegularFile,
   sameRegularFileState,
   type StableRegularFileDescriptor,
 } from "../filesystem/RegularFile.js";
 
-const PACK_DIR_ENCRYPTED = 1 << 0;
-const PACK_REL_FILEBASE = 1 << 1;
-const PACK_SPARSE_BUNDLE = 1 << 2;
-const PACK_FILE_ENCRYPTED = 1 << 0;
-const PACK_FILE_REMOVAL = 1 << 1;
-/** Godot 4.0-4.3 write format 2; Godot 4.4 and later write format 3. */
-const SUPPORTED_FORMAT_VERSIONS = new Set([2, 3]);
-/** Path length, offset, size, MD5, and flags with an empty path. */
-const MINIMUM_ENTRY_BYTES = 4 + 8 + 8 + 16 + 4;
-const TRAILER_BYTES = 8 + 4;
+const PACK_DIR_ENCRYPTED = 1;
+const PACK_REL_FILEBASE = 2;
+const PACK_SPARSE_BUNDLE = 4;
+const PACK_FILE_ENCRYPTED = 1;
+const MINIMUM_ENTRY_BYTES = 40;
 const DIRECTORY_CHUNK_BYTES = 64 * 1024;
-/** Member paths are project file paths; 4096 bytes is Linux PATH_MAX. */
-const MAX_MEMBER_PATH_BYTES = 4096;
-/**
- * Directory metadata is retained in memory for the reader's lifetime. A real
- * 1.6 GB export with 3937 members has a 0.4 MiB directory.
- */
-const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024;
-const PCK_UTF8_DECODER = new TextDecoder("utf-8", {
-  fatal: true,
-  ignoreBOM: true,
-});
+/** Encoded retained entry metadata, including escaped paths and source facts. */
+const MAX_DIRECTORY_METADATA_BYTES = 64 * 1024 * 1024;
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-/** Observed pack header facts; offsets are absolute file positions. */
-export interface GodotPckHeader {
-  readonly packStart: number;
-  readonly packEnd: number;
-  readonly embedded: boolean;
-  readonly formatVersion: number;
-  readonly engineVersion: string;
-  readonly packFlags: number;
-  readonly fileBase: number;
-  readonly directoryStart: number;
-  readonly fileCount: number;
-}
-
-interface GodotPckRecord {
-  readonly path: string;
-  readonly offset: number;
-  readonly size: number;
-  readonly md5: string | null;
-  readonly encrypted: boolean;
-}
-
-/**
- * Godot Engine PCK adapter for standalone packs and packs embedded through the
- * executable trailer. Members are stored uncompressed, so reads are byte ranges
- * verified against each member's declared MD5.
- */
+/** One descriptor, one validated directory, and bounded positional member reads. */
 export class GodotPckArtifactReader implements ArtifactReader {
   readonly format = "godot-pck" as const;
-  #handle: FileHandle | undefined;
+  readonly #scope = new ArtifactResourceScope();
+  readonly #entries = new Map<string, ArtifactEntry>();
+  readonly #streams = new Set<Readable>();
   #owner: OwnedFileHandle | undefined;
-  #header: GodotPckHeader | undefined;
-  readonly #entries = new Map<
-    string,
-    { readonly record: GodotPckRecord; readonly metadata: ArtifactEntry }
-  >();
+  #initial: Stats | undefined;
+  #opening: Promise<FileHandle> | undefined;
+  #prepared: Promise<void> | undefined;
+  #header: GodotPckMetadata | undefined;
+  #closing = false;
+  #boundSha256: string | undefined;
 
   constructor(
     private readonly path: string,
     private readonly admitted?: StableRegularFileDescriptor,
   ) {}
 
-  /** Header facts are available after the first `entries()` traversal. */
-  header(): GodotPckHeader | undefined {
-    return this.#header;
+  formatMetadata(): GodotPckMetadata | undefined {
+    return this.#header === undefined ? undefined : { ...this.#header };
   }
 
-  async *entries(signal?: AbortSignal): AsyncIterable<ArtifactEntry> {
-    const handle = await this.#open();
-    abortIfNeeded(signal);
-    const size = (await handle.stat()).size;
-    const header = await readPckHeader(handle, size);
-    this.#header = header;
-    const records = await readPckDirectory(handle, header, signal);
-    for (const [index, record] of records.entries()) {
-      abortIfNeeded(signal);
-      const metadata: ArtifactEntry = {
-        path: record.path,
-        kind: "file",
-        declaredSize: record.size,
-        compressedSize: null,
-        executable: false,
-        encrypted: record.encrypted,
-        byteOffset: record.offset,
-        declaredSha256: null,
-        unpacked: false,
-        // ponytail: MD5 is checked on read and fails closed; carrying it as
-        // declared integrity needs an ArtifactEntry digest-algorithm field.
-        limitations:
-          record.md5 === null
-            ? ["Godot PCK member declares no MD5; content was not verified."]
-            : [],
-        adapterKey: `godot-pck-entry:${String(index)}`,
-      };
-      this.#entries.set(metadata.adapterKey, {
-        record,
-        metadata: copyArtifactEntry(metadata),
+  async prepareContainer(
+    expectedSha256: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#scope.run(async () => {
+      this.#assertOpen(signal);
+      const handle = await this.#assertStable(signal);
+      const observed =
+        this.#boundSha256 ??
+        (
+          await hashReadable(
+            readFileHandleChunks(handle, {
+              signal,
+              cancellationFailure: (reason) =>
+                new ArtifactReaderFailure(
+                  "cancelled",
+                  "Godot PCK verification cancelled",
+                  { cause: reason },
+                ),
+            }),
+            signal,
+          )
+        ).sha256;
+      await this.#assertStable(signal);
+      if (observed !== expectedSha256)
+        throw new ArtifactReaderFailure(
+          "integrity",
+          "Godot PCK carrier changed after inventory",
+          undefined,
+          artifactIntegrityDetails(
+            ".",
+            { algorithm: "sha256", digest: expectedSha256 },
+            observed,
+            false,
+          ),
+        );
+      this.#boundSha256 = observed;
+    });
+  }
+
+  async *entries(
+    signal?: AbortSignal,
+    options?: ArtifactTraversalOptions,
+  ): AsyncIterable<ArtifactEntry> {
+    await this.#scope.run(async () => {
+      this.#assertOpen(signal);
+      this.#prepared ??= this.#prepare(signal);
+      await this.#prepared;
+      await this.#assertStable(signal);
+    });
+    if (this.#header?.directory_status !== "available") {
+      options?.onCoverage?.({
+        status: "unknown",
+        limitations: [
+          this.#header?.directory_status === "encrypted"
+            ? "Godot PCK directory is encrypted; member identities and contents remain unknown."
+            : "Godot PCK sparse-bundle member bytes are external and were not traversed.",
+        ],
       });
-      yield metadata;
+      return;
+    }
+    let index = 0;
+    for (const entry of this.#entries.values()) {
+      if (index++ % 256 === 0) await setImmediate();
+      this.#assertOpen(signal);
+      yield copyArtifactEntry(entry);
     }
   }
 
   async open(entry: ArtifactEntry, signal?: AbortSignal): Promise<Readable> {
-    abortIfNeeded(signal);
-    const stored = this.#entries.get(entry.adapterKey);
-    if (stored === undefined || !sameArtifactEntry(entry, stored.metadata))
-      throw new ArtifactReaderFailure(
-        "integrity",
-        "Godot PCK entry metadata does not match this reader's inventory",
-      );
-    const { record } = stored;
-    if (record.encrypted)
-      throw new ArtifactReaderFailure(
-        "unavailable",
-        `Encrypted Godot PCK member is unsupported: ${record.path}`,
-      );
-    const handle = await this.#open();
-    const source =
-      record.size === 0
-        ? Readable.from([])
-        : readFileHandleChunks(handle, {
-            start: record.offset,
-            end: record.offset + record.size - 1,
-          });
-    const output = verifyMember(record, signal);
-    const onAbort = (): void => {
-      output.destroy(cancelled());
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-    output.once("close", () => signal?.removeEventListener("abort", onAbort));
-    // pipeline forwards source errors to `output` and destroys the source when
-    // the consumer closes `output` early. Positional reads never close the
-    // reader-owned handle, unlike a FileHandle read stream.
-    pipeline(source, output, () => undefined);
-    return output;
+    return this.#scope.run(async () => {
+      this.#assertOpen(signal);
+      const stored = this.#entries.get(entry.adapterKey);
+      if (stored === undefined || !sameArtifactEntry(entry, stored))
+        throw new ArtifactReaderFailure(
+          "integrity",
+          "Godot PCK entry does not match its owning inventory",
+        );
+      if (stored.encrypted)
+        throw new ArtifactReaderFailure(
+          "unavailable",
+          `Encrypted Godot PCK member is unsupported: ${stored.path}`,
+        );
+      const handle = await this.#assertStable(signal);
+      this.#assertOpen(signal);
+      if (stored.byteOffset === null || stored.declaredSize === null)
+        throw formatFailure("member has no physical byte range");
+      const source =
+        stored.declaredSize === 0
+          ? Readable.from([])
+          : readFileHandleChunks(handle, {
+              start: stored.byteOffset,
+              end: stored.byteOffset + stored.declaredSize - 1,
+              signal,
+              cancellationFailure: (reason) =>
+                new ArtifactReaderFailure(
+                  "cancelled",
+                  "Godot PCK read cancelled",
+                  { cause: reason },
+                ),
+            });
+      const output = this.#memberStream(stored, signal);
+      // The returned stream still reports failures to its consumer. Also handle
+      // retirement before a caller has attached its own error listener.
+      output.on("error", () => undefined);
+      this.#streams.add(output);
+      void this.#scope
+        .run(
+          () =>
+            new Promise<void>((resolve) => {
+              pipeline(source, output, () => {
+                this.#streams.delete(output);
+                resolve();
+              });
+            }),
+        )
+        .catch((cause: unknown) =>
+          output.destroy(
+            cause instanceof Error
+              ? cause
+              : new Error("Godot PCK stream ownership failed", { cause }),
+          ),
+        );
+      return output;
+    });
   }
 
   async close(): Promise<void> {
-    if (this.#owner === undefined) return;
-    await this.#owner.close();
-    this.#owner = undefined;
-    this.#handle = undefined;
+    this.#closing = true;
+    for (const stream of this.#streams)
+      stream.destroy(
+        new ArtifactReaderFailure("unavailable", "Godot PCK reader closed"),
+      );
+    await this.#scope.close();
+    if (this.#owner !== undefined) {
+      await this.#owner.close();
+      this.#owner = undefined;
+    }
+    this.#entries.clear();
   }
 
   provenance(): readonly [] {
     return [];
   }
 
-  async #open(): Promise<FileHandle> {
-    if (this.#handle !== undefined) return this.#handle;
+  #assertOpen(signal?: AbortSignal): void {
+    assertArtifactReadActive(signal);
+    if (this.#closing)
+      throw new ArtifactReaderFailure(
+        "unavailable",
+        "Godot PCK reader is closed",
+      );
+  }
+
+  #open(signal?: AbortSignal): Promise<FileHandle> {
+    this.#opening ??= this.#admit(signal);
+    return this.#opening;
+  }
+
+  async #admit(signal?: AbortSignal): Promise<FileHandle> {
     try {
       const handle =
         this.admitted?.handle ??
-        (await openRegularFile(this.path, { symlinks: "reject" }));
+        (await openRegularFile(this.path, { symlinks: "reject", signal }));
       if (this.admitted === undefined)
         this.#owner = new OwnedFileHandle(handle);
-      this.#handle = handle;
+      this.#initial = this.admitted?.initial ?? (await handle.stat());
+      return handle;
     } catch (cause: unknown) {
       if (cause instanceof RegularFileAdmissionFailure) {
         this.#owner = cause.owner;
         throw ArtifactReaderFailure.withCleanup(
-          cause.cause instanceof NonRegularFileReadError
-            ? notRegular(this.path, cause.cause)
-            : cause.cause,
+          admissionFailure(cause.cause, this.path),
           ArtifactReaderFailure.cleanupObservation(
             cause.cleanupCause,
             this.path,
           ),
         );
       }
-      if (cause instanceof NonRegularFileReadError)
-        throw notRegular(this.path, cause);
-      throw cause;
+      throw admissionFailure(cause, this.path);
     }
+  }
+
+  async #assertStable(signal?: AbortSignal): Promise<FileHandle> {
+    assertArtifactReadActive(signal);
+    const handle = await this.#open(signal);
+    const observed = await handle.stat();
     if (
-      this.admitted !== undefined &&
-      !sameRegularFileState(this.admitted.initial, await this.#handle.stat())
+      this.#initial === undefined ||
+      !sameRegularFileState(this.#initial, observed)
     )
       throw new ArtifactReaderFailure(
         "integrity",
-        `Godot PCK source identity changed before reading: ${this.path}`,
+        `Godot PCK source identity changed: ${this.path}`,
       );
-    return this.#handle;
+    assertArtifactReadActive(signal);
+    return handle;
+  }
+
+  async #prepare(signal?: AbortSignal): Promise<void> {
+    const handle = await this.#assertStable(signal);
+    const initial = this.#initial;
+    if (initial === undefined)
+      throw formatFailure("source identity was not admitted");
+    const header = await readGodotPckHeader(handle, initial.size, signal);
+    this.#header = header;
+    if (header.directory_status !== "available") return;
+    const cursor = new PckCursor(
+      handle,
+      header.directory_start + 4,
+      header.pack_end,
+      signal,
+    );
+    let retainedBytes = 0;
+    for (let index = 0; index < header.declared_file_count; index++) {
+      if (index % 256 === 0) await setImmediate();
+      assertArtifactReadActive(signal);
+      const pathBytes = await cursor.uint32();
+      // Check worst-case JSON escaping before decoding or allocating the path.
+      // Its source bytes, decoded string and retained metadata share one budget.
+      if (pathBytes * 12 > MAX_DIRECTORY_METADATA_BYTES - retainedBytes)
+        throw metadataLimit();
+      const rawPath = await cursor.bytes(pathBytes);
+      const offset = await cursor.uint64();
+      const size = await cursor.uint64();
+      const md5 = (await cursor.bytes(16)).toString("hex");
+      const flags = await cursor.uint32();
+      if ((flags & ~PACK_FILE_ENCRYPTED) !== 0)
+        throw new ArtifactReaderFailure(
+          "unavailable",
+          `Godot patch or unknown member flags are unsupported: 0x${flags.toString(16)}`,
+        );
+      const sourcePath = pckMemberPath(rawPath);
+      const start = toSafeOffset(
+        offset,
+        header.file_base,
+        header.pack_end,
+        sourcePath,
+      );
+      if (size > BigInt(header.pack_end - start))
+        throw formatFailure(`member exceeds the pack: ${sourcePath}`);
+      const metadata = {
+        path: sourcePath.startsWith("res://")
+          ? sourcePath.slice(6)
+          : sourcePath,
+        kind: "file" as const,
+        declaredSize: Number(size),
+        compressedSize: null,
+        executable: false,
+        encrypted: (flags & PACK_FILE_ENCRYPTED) !== 0,
+        byteOffset: start,
+        declaredIntegrity: /^0{32}$/u.test(md5)
+          ? null
+          : { algorithm: "md5" as const, digest: md5 },
+        unpacked: false,
+        limitations: /^0{32}$/u.test(md5)
+          ? ["Godot PCK declares an all-zero MD5; source integrity is unknown."]
+          : [],
+        adapterKey: `godot-pck-entry:${String(index)}`,
+        formatMetadata: {
+          kind: "godot-pck-entry" as const,
+          index,
+          source_path: sourcePath,
+          declared_offset: Number(offset),
+          flags,
+          md5_status: /^0{32}$/u.test(md5)
+            ? ("all-zero" as const)
+            : ("declared" as const),
+        },
+      } satisfies ArtifactEntry;
+      retainedBytes += jsonValueByteLength(
+        metadata,
+        MAX_DIRECTORY_METADATA_BYTES - retainedBytes,
+      );
+      if (retainedBytes > MAX_DIRECTORY_METADATA_BYTES) throw metadataLimit();
+      this.#entries.set(metadata.adapterKey, metadata);
+    }
+    await this.#assertStable(signal);
+  }
+
+  #memberStream(entry: ArtifactEntry, signal?: AbortSignal): Transform {
+    let bytes = 0;
+    const check = async (): Promise<void> => {
+      if (bytes !== entry.declaredSize)
+        throw formatFailure(`member ended early: ${entry.path}`);
+      await this.#assertStable(signal);
+    };
+    return new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytes += chunk.length;
+        callback(null, chunk);
+      },
+      flush(callback) {
+        void check().then(
+          () => callback(),
+          (cause: unknown) =>
+            callback(
+              cause instanceof Error
+                ? cause
+                : new Error("Godot PCK read failed", { cause }),
+            ),
+        );
+      },
+    });
   }
 }
 
-/** Locate and validate the pack header, mirroring Godot's own lookup order. */
-export const readPckHeader = async (
+/** Decode header fields once; unsupported content does not erase observed headers. */
+export const readGodotPckHeader = async (
   handle: FileHandle,
-  fileSize: number,
-): Promise<GodotPckHeader> => {
-  let packStart = 0;
-  let packEnd = fileSize;
-  let embedded = false;
-  if ((await readUint32(handle, 0, fileSize)) !== GODOT_PCK_MAGIC) {
-    if (
-      fileSize < TRAILER_BYTES ||
-      (await readUint32(handle, fileSize - 4, fileSize)) !== GODOT_PCK_MAGIC
-    )
-      throw formatFailure("no Godot PCK header or executable trailer");
-    const packBytes = await readUint64(
-      handle,
-      fileSize - TRAILER_BYTES,
-      fileSize,
-    );
-    if (packBytes > fileSize - TRAILER_BYTES)
-      throw formatFailure("embedded pack size exceeds the file");
-    packEnd = fileSize - TRAILER_BYTES;
-    packStart = packEnd - packBytes;
-    embedded = true;
-    if ((await readUint32(handle, packStart, packEnd)) !== GODOT_PCK_MAGIC)
-      throw formatFailure("embedded pack trailer does not point at a header");
-  }
-  const fixed = await readExact(handle, packStart, 40, packEnd);
-  const formatVersion = fixed.readUInt32LE(4);
-  const engineVersion = [8, 12, 16]
-    .map((offset) => String(fixed.readUInt32LE(offset)))
-    .join(".");
-  if (!SUPPORTED_FORMAT_VERSIONS.has(formatVersion))
+  size: number,
+  signal?: AbortSignal,
+): Promise<GodotPckMetadata> => {
+  const location = await locateGodotPck(handle, size, signal);
+  if (location === undefined)
+    throw formatFailure("no standalone header or executable trailer");
+  const { start, end, embedded } = location;
+  const fixed = await readPckBytes(handle, start, 40, end, signal);
+  const version = fixed.readUInt32LE(4);
+  if (![2, 3, 4].includes(version))
     throw new ArtifactReaderFailure(
       "unavailable",
-      `Godot PCK format version ${String(formatVersion)} (engine ${engineVersion}) is unsupported; formats 2 and 3 are read`,
+      `Godot PCK format ${String(version)} is unsupported; plain formats 2, 3 and 4 are supported`,
     );
-  const packFlags = fixed.readUInt32LE(20);
-  const unsupportedFlags =
-    packFlags & ~(PACK_REL_FILEBASE | PACK_DIR_ENCRYPTED | PACK_SPARSE_BUNDLE);
-  if (unsupportedFlags !== 0)
+  const flags = fixed.readUInt32LE(20);
+  if (
+    (flags & ~(PACK_DIR_ENCRYPTED | PACK_REL_FILEBASE | PACK_SPARSE_BUNDLE)) !==
+    0
+  )
     throw new ArtifactReaderFailure(
       "unavailable",
-      `Godot PCK declares unknown pack flags 0x${unsupportedFlags.toString(16)}`,
+      `Godot PCK declares unknown pack flags 0x${flags.toString(16)}`,
     );
-  if ((packFlags & PACK_DIR_ENCRYPTED) !== 0)
-    throw new ArtifactReaderFailure(
-      "unavailable",
-      "Godot PCK directory is encrypted; member identities are unknown",
-    );
-  if ((packFlags & PACK_SPARSE_BUNDLE) !== 0)
-    throw new ArtifactReaderFailure(
-      "unavailable",
-      "Godot PCK is a sparse bundle whose member bytes live outside this file",
-    );
-  // Format 3 offsets are always pack-relative; format 2 opts in with a flag.
-  const relative = formatVersion === 3 || (packFlags & PACK_REL_FILEBASE) !== 0;
   const fileBase = toSafeOffset(
     fixed.readBigUInt64LE(24),
-    relative ? packStart : 0,
-    packEnd,
+    version >= 3 || (flags & PACK_REL_FILEBASE) !== 0 ? start : 0,
+    end,
     "file base",
   );
-  const directoryStart =
-    formatVersion === 3
-      ? toSafeOffset(fixed.readBigUInt64LE(32), packStart, packEnd, "directory")
-      : // Format 2: 16 reserved uint32 values follow the file base.
-        packStart + 32 + 64;
-  const fileCount = await readUint32(handle, directoryStart, packEnd);
-  if (fileCount * MINIMUM_ENTRY_BYTES > packEnd - directoryStart - 4)
-    throw formatFailure(
-      `${String(fileCount)} declared members cannot fit in the pack directory`,
-    );
+  const directory =
+    version >= 3
+      ? toSafeOffset(fixed.readBigUInt64LE(32), start, end, "directory")
+      : start + 96;
+  const count = (
+    await readPckBytes(handle, directory, 4, end, signal)
+  ).readUInt32LE(0);
+  const status =
+    (flags & PACK_DIR_ENCRYPTED) !== 0
+      ? "encrypted"
+      : (flags & PACK_SPARSE_BUNDLE) !== 0
+        ? "sparse-bundle"
+        : "available";
+  if (
+    status === "available" &&
+    count * MINIMUM_ENTRY_BYTES > end - directory - 4
+  )
+    throw formatFailure("declared member count cannot fit in the directory");
   return {
-    packStart,
-    packEnd,
+    kind: "godot-pck",
+    format_version: version,
+    engine_major: fixed.readUInt32LE(8),
+    engine_minor: fixed.readUInt32LE(12),
+    engine_patch: fixed.readUInt32LE(16),
+    pack_start: start,
+    pack_end: end,
     embedded,
-    formatVersion,
-    engineVersion,
-    packFlags,
-    fileBase,
-    directoryStart,
-    fileCount,
+    pack_flags: flags,
+    file_base: fileBase,
+    directory_start: directory,
+    declared_file_count: count,
+    directory_status: status,
   };
 };
 
-const readPckDirectory = async (
-  handle: FileHandle,
-  header: GodotPckHeader,
-  signal?: AbortSignal,
-): Promise<GodotPckRecord[]> => {
-  const cursor = new PckCursor(
-    handle,
-    header.directoryStart + 4,
-    header.packEnd,
-  );
-  const records: GodotPckRecord[] = [];
-  for (let index = 0; index < header.fileCount; index += 1) {
-    abortIfNeeded(signal);
-    const pathBytes = await cursor.uint32();
-    if (pathBytes > MAX_MEMBER_PATH_BYTES)
-      throw new ArtifactReaderFailure(
-        "limit",
-        `Godot PCK member ${String(index)} declares a ${String(pathBytes)}-byte path, exceeding the ${String(MAX_MEMBER_PATH_BYTES)}-byte path limit`,
-      );
-    // The path length is bounded by the bytes left in the pack before allocation.
-    const rawPath = await cursor.bytes(pathBytes);
-    const offset = await cursor.uint64();
-    const size = await cursor.uint64();
-    const md5 = await cursor.bytes(16);
-    const flags = await cursor.uint32();
-    const path = pckMemberPath(rawPath);
-    if ((flags & PACK_FILE_REMOVAL) !== 0)
-      throw new ArtifactReaderFailure(
-        "unavailable",
-        `Godot patch-pack removal entries are not modeled: ${path}`,
-      );
-    if ((flags & ~PACK_FILE_ENCRYPTED) !== 0)
-      throw new ArtifactReaderFailure(
-        "unavailable",
-        `Godot PCK member declares unknown flags 0x${flags.toString(16)}: ${path}`,
-      );
-    const start = toSafeOffset(offset, header.fileBase, header.packEnd, path);
-    if (size > BigInt(header.packEnd - start))
-      throw formatFailure(`member data exceeds the pack: ${path}`);
-    records.push({
-      path,
-      offset: start,
-      size: Number(size),
-      md5: md5.every((byte) => byte === 0) ? null : md5.toString("hex"),
-      encrypted: (flags & PACK_FILE_ENCRYPTED) !== 0,
-    });
-  }
-  return records;
-};
-
-/** Godot stores NUL-padded UTF-8 paths, with or without the `res://` scheme. */
 const pckMemberPath = (raw: Buffer): string => {
   let end = raw.length;
-  while (end > 0 && raw[end - 1] === 0) end -= 1;
+  while (end > 0 && raw[end - 1] === 0) end--;
   let path: string;
   try {
-    path = PCK_UTF8_DECODER.decode(raw.subarray(0, end));
+    path = UTF8.decode(raw.subarray(0, end));
   } catch (cause: unknown) {
     throw new ArtifactReaderFailure(
       "format",
-      "Godot PCK member path is not valid UTF-8",
+      "Godot PCK path is not valid UTF-8",
       { cause },
     );
   }
-  const relative = path.startsWith("res://") ? path.slice(6) : path;
-  if (relative.length === 0 || relative.includes("\0"))
-    throw formatFailure(`invalid member path ${JSON.stringify(path)}`);
-  return relative;
+  if (path.length === 0 || path === "res://" || path.includes("\0"))
+    throw formatFailure("empty or NUL-containing member path");
+  return path;
 };
 
-/** Sequential directory reader with bounded, chunked file reads. */
+/** One bounded read window; no whole-pack buffer or per-member source reopening. */
 class PckCursor {
   #buffer: Buffer = Buffer.alloc(0);
   #bufferStart = 0;
-  #consumed = 0;
-
   constructor(
     private readonly handle: FileHandle,
     private position: number,
     private readonly end: number,
+    private readonly signal?: AbortSignal,
   ) {}
-
   async bytes(length: number): Promise<Buffer> {
     if (length > this.end - this.position)
       throw formatFailure("directory entry exceeds the pack");
-    this.#consumed += length;
-    if (this.#consumed > MAX_DIRECTORY_BYTES)
-      throw new ArtifactReaderFailure(
-        "limit",
-        `Godot PCK directory exceeds the ${String(MAX_DIRECTORY_BYTES)}-byte metadata budget`,
-      );
-    const offset = this.position - this.#bufferStart;
-    if (offset < 0 || offset + length > this.#buffer.length) {
-      this.#buffer = await readExact(
+    if (length > MAX_DIRECTORY_METADATA_BYTES / 12) throw metadataLimit();
+    if (length > DIRECTORY_CHUNK_BYTES) {
+      // A large valid virtual path is bounded by retained representation, not
+      // the host filesystem's PATH_MAX. Only this path receives a larger read.
+      const value = await readPckBytes(
         this.handle,
         this.position,
-        Math.min(
-          Math.max(length, DIRECTORY_CHUNK_BYTES),
-          this.end - this.position,
-        ),
+        length,
         this.end,
+        this.signal,
+      );
+      this.position += length;
+      return value;
+    }
+    const offset = this.position - this.#bufferStart;
+    if (offset < 0 || offset + length > this.#buffer.length) {
+      this.#buffer = await readPckBytes(
+        this.handle,
+        this.position,
+        Math.min(DIRECTORY_CHUNK_BYTES, this.end - this.position),
+        this.end,
+        this.signal,
       );
       this.#bufferStart = this.position;
     }
@@ -402,112 +495,55 @@ class PckCursor {
     this.position += length;
     return this.#buffer.subarray(start, start + length);
   }
-
   async uint32(): Promise<number> {
     return (await this.bytes(4)).readUInt32LE(0);
   }
-
   async uint64(): Promise<bigint> {
     return (await this.bytes(8)).readBigUInt64LE(0);
   }
 }
 
-const verifyMember = (
-  record: GodotPckRecord,
-  signal?: AbortSignal,
-): Transform => {
-  const hash = createHash("md5");
-  let bytes = 0;
-  return new Transform({
-    transform(chunk: Buffer, _encoding, callback) {
-      if (signal?.aborted === true) {
-        callback(cancelled());
-        return;
-      }
-      hash.update(chunk);
-      bytes += chunk.length;
-      callback(null, chunk);
-    },
-    flush(callback) {
-      if (bytes !== record.size) {
-        callback(formatFailure(`member ended early: ${record.path}`));
-        return;
-      }
-      const observed = hash.digest("hex");
-      if (record.md5 !== null && observed !== record.md5) {
-        callback(
-          new ArtifactReaderFailure(
-            "integrity",
-            `Godot PCK member MD5 ${observed} contradicts declared ${record.md5}: ${record.path}`,
-          ),
-        );
-        return;
-      }
-      callback();
-    },
-  });
-};
-
-const readExact = async (
-  handle: FileHandle,
-  position: number,
-  length: number,
-  end: number,
-): Promise<Buffer> => {
-  if (position < 0 || length > end - position)
-    throw formatFailure("read exceeds the pack");
-  const buffer = Buffer.alloc(length);
-  const { bytesRead } = await handle.read(buffer, 0, length, position);
-  if (bytesRead !== length) throw formatFailure("file is truncated");
-  return buffer;
-};
-
-const readUint32 = async (
-  handle: FileHandle,
-  position: number,
-  end: number,
-): Promise<number> =>
-  (await readExact(handle, position, 4, end)).readUInt32LE(0);
-
-const readUint64 = async (
-  handle: FileHandle,
-  position: number,
-  end: number,
-): Promise<number> => {
-  const value = (await readExact(handle, position, 8, end)).readBigUInt64LE(0);
-  if (value > BigInt(Number.MAX_SAFE_INTEGER))
-    throw formatFailure("64-bit size exceeds the safe integer range");
-  return Number(value);
-};
-
-/** Resolve `base + offset` and require it inside `[base, end]`. */
 const toSafeOffset = (
   offset: bigint,
   base: number,
   end: number,
   subject: string,
 ): number => {
-  if (offset > BigInt(end - base))
-    throw formatFailure(`${subject} offset lies outside the pack`);
+  if (base > end || offset > BigInt(end - base))
+    throw formatFailure(`${subject} offset exceeds the pack`);
   return base + Number(offset);
 };
-
 const formatFailure = (detail: string): ArtifactReaderFailure =>
   new ArtifactReaderFailure("format", `Godot PCK is malformed: ${detail}`);
-
-const notRegular = (
-  path: string,
-  cause: NonRegularFileReadError,
-): ArtifactReaderFailure =>
+const metadataLimit = (): ArtifactReaderFailure =>
   new ArtifactReaderFailure(
-    "format",
-    `Godot PCK source is not a regular file: ${path}`,
-    { cause },
+    "limit",
+    "Godot PCK directory exceeds the 64 MiB encoded metadata budget",
+    { boundary: "memory" },
   );
 
-const cancelled = (): ArtifactReaderFailure =>
-  new ArtifactReaderFailure("cancelled", "Godot PCK operation cancelled");
-
-const abortIfNeeded = (signal?: AbortSignal): void => {
-  if (signal?.aborted === true) throw cancelled();
+const admissionFailure = (
+  cause: unknown,
+  path: string,
+): ArtifactReaderFailure => {
+  if (cause instanceof ArtifactReaderFailure) return cause;
+  if (cause instanceof RegularFileOperationCancelled)
+    return new ArtifactReaderFailure(
+      "cancelled",
+      "Godot PCK admission cancelled",
+      { cause: cause.reason },
+    );
+  if (cause instanceof NonRegularFileReadError)
+    return new ArtifactReaderFailure(
+      "format",
+      `Godot PCK source is not a regular file: ${path}`,
+      { cause },
+    );
+  return new ArtifactReaderFailure(
+    "io",
+    cause instanceof Error
+      ? cause.message
+      : `Cannot admit Godot PCK source: ${path}`,
+    { cause },
+  );
 };
