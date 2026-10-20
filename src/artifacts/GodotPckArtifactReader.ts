@@ -1,3 +1,4 @@
+import { artifactExpansionBudgetBytes } from "../domain/artifactExpansionBudget.js";
 import { hashReadable } from "./ArtifactHash.js";
 import { artifactIntegrityDetails } from "../domain/artifactIntegrity.js";
 import type { Stats } from "node:fs";
@@ -275,6 +276,10 @@ export class GodotPckArtifactReader implements ArtifactReader {
       signal,
     );
     let retainedBytes = 0;
+    let declaredPlaintextBytes = 0n;
+    const expansionBudget = BigInt(
+      artifactExpansionBudgetBytes(header.pack_end - header.pack_start),
+    );
     for (let index = 0; index < header.declared_file_count; index++) {
       if (index % 256 === 0) await setImmediate();
       assertArtifactReadActive(signal);
@@ -302,6 +307,16 @@ export class GodotPckArtifactReader implements ArtifactReader {
       );
       if (size > BigInt(header.pack_end - start))
         throw formatFailure(`member exceeds the pack: ${sourcePath}`);
+      // Aliases are valid, but each path causes another hash/copy. Admit the
+      // complete directory before yielding anything, including all-zero claims.
+      if ((flags & PACK_FILE_ENCRYPTED) === 0) {
+        declaredPlaintextBytes += size;
+        if (declaredPlaintextBytes > expansionBudget)
+          throw new ArtifactReaderFailure(
+            "limit",
+            `Godot PCK readable entries declare ${String(declaredPlaintextBytes)} plaintext bytes, exceeding this pack's ${String(expansionBudget)}-byte expansion budget`,
+          );
+      }
       const metadata = {
         path: sourcePath.startsWith("res://")
           ? sourcePath.slice(6)

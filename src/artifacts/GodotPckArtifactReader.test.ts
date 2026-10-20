@@ -1,5 +1,6 @@
 import {
   buildGodotPck,
+  buildAliasedGodotPck,
   embedGodotPck,
   pckU32,
   pckU64,
@@ -260,5 +261,55 @@ describe("GodotPckArtifactReader member streams", () => {
     } finally {
       await handle.close();
     }
+  });
+});
+
+describe("Godot PCK logical-byte admission", () => {
+  it.each([2, 3, 4] as const)(
+    "rejects total repeated plaintext work before yielding format %s members",
+    async (version) => {
+      await withReader(buildAliasedGodotPck(version, 1100), async (reader) => {
+        let emitted = 0;
+        let failure: unknown;
+        try {
+          for await (const _entry of reader.entries()) emitted++;
+        } catch (cause) {
+          failure = cause;
+        }
+        expect(failure).toMatchObject({ reason: "limit" });
+        expect(emitted).toBe(0);
+      });
+    },
+  );
+  it("uses the actual pack span rather than granting budget for an embedded carrier", async () => {
+    const pack = buildAliasedGodotPck(4, 1100);
+    const carrier = Buffer.alloc(1024 * 1024);
+    await withReader(
+      Buffer.concat([carrier, pack, pckU64(pack.length), Buffer.from("GDPC")]),
+      async (reader) => {
+        let failure: unknown;
+        try {
+          await list(reader);
+        } catch (cause) {
+          failure = cause;
+        }
+        expect(failure).toMatchObject({ reason: "limit" });
+      },
+    );
+  });
+  it("allows bounded aliases and never charges encrypted content that it will not read", async () => {
+    await withReader(buildAliasedGodotPck(4, 2, 4), async (reader) => {
+      const entries = await list(reader);
+      expect(await text(await reader.open(entries[0]!))).toBe("xxxx");
+      expect(await text(await reader.open(entries[1]!))).toBe("xxxx");
+    });
+    await withReader(
+      buildAliasedGodotPck(4, 1100, 256 * 1024, 1),
+      async (reader) => {
+        const entries = await list(reader);
+        expect(entries).toHaveLength(1100);
+        expect(entries.every((entry) => entry.encrypted)).toBe(true);
+      },
+    );
   });
 });

@@ -6,6 +6,7 @@ export interface GodotPckMember {
   readonly flags?: number;
   readonly md5?: Buffer;
   readonly size?: bigint;
+  readonly offset?: bigint;
 }
 
 export const pckU32 = (value: number): Buffer => {
@@ -48,7 +49,7 @@ export const buildGodotPck = (
       return [
         pckU32(path.length),
         path,
-        pckU64(offsets[index] ?? 0),
+        pckU64(member.offset ?? BigInt(offsets[index] ?? 0)),
         pckU64(member.size ?? BigInt(Buffer.byteLength(member.data))),
         member.md5 ?? createHash("md5").update(member.data).digest(),
         pckU32(member.flags ?? 0),
@@ -83,3 +84,22 @@ export const embedGodotPck = (pack: Buffer): Buffer =>
     pckU64(pack.length),
     Buffer.from("GDPC"),
   ]);
+
+/** Repeated physical ranges are valid aliases but multiply plaintext I/O per path. */
+export const buildAliasedGodotPck = (
+  version: 2 | 3 | 4,
+  count: number,
+  entryBytes = 256 * 1024,
+  flags = 0,
+): Buffer =>
+  buildGodotPck(
+    version,
+    Array.from({ length: count }, (_, index) => ({
+      path: `res://aliases/${String(index)}.bin`,
+      data: index === 0 ? "x".repeat(entryBytes) : "",
+      offset: 0n,
+      size: BigInt(entryBytes),
+      md5: Buffer.alloc(16),
+      flags,
+    })),
+  );

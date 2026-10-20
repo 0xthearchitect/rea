@@ -98,3 +98,11 @@ retain header facts with unknown member coverage. Extraction refuses an
 unreadable directory or encrypted member. This capability does not recover
 keys, decode Godot resources, decompile GDScript bytecode, analyze signals,
 apply patch/removal entries or execute targets.
+
+Readable logical member bytes, including repeated physical ranges, share the ZIP
+archive expansion policy: at most the larger of 256 MiB or 500 times the PCK's
+encoded byte span. Embedded carrier bytes do not enlarge that budget. The full
+directory is checked before any member is yielded, hashed or extracted. Encrypted
+members are not read and do not consume this plaintext-work allowance. Small
+bounded aliases remain valid. This is a processing/output resource bound, separate
+from the directory metadata retention budget and format validity.

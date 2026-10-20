@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect } from "vitest";
 import { cliTest } from "../support/cli/cliFixture.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
-import { buildGodotPck, pckU64 } from "../fixtures/godotPck.js";
+import {
+  buildAliasedGodotPck,
+  buildGodotPck,
+  pckU64,
+} from "../fixtures/godotPck.js";
 import { elf } from "../../src/domain/binaryTarget.fixture.js";
 import { readEvidenceBundle } from "../../src/application/EvidenceBundleFiles.js";
 import { analysisViewResultSchema } from "../../src/domain/analysisView/analysisView.js";
@@ -296,6 +300,40 @@ cliTest(
         parent_occurrence_id: expect.any(String),
       }),
     ]);
+  },
+  30000,
+);
+
+cliTest(
+  "rejects repeated-range expansion before hashing members or creating extraction output",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-pck-expansion-");
+    const source = join(root, "aliased.pck");
+    await writeFile(source, buildAliasedGodotPck(4, 1100));
+    for (const operation of ["inspect-artifact", "extract-artifact"]) {
+      for (const policy of ["fail", "record-and-continue"]) {
+        const reply = await cli.run({
+          arguments: [
+            operation,
+            source,
+            "--integrity-policy",
+            policy,
+            "--json",
+          ],
+          environment: { TMPDIR: root, TMP: root, TEMP: root },
+        });
+        expect(reply.exitCode, reply.stdout + reply.stderr).toBe(1);
+        expect(reply.json).toMatchObject({
+          code: "truncated",
+          details: {
+            reason: "limit",
+            truncated: true,
+            detail: expect.stringContaining("expansion budget"),
+          },
+        });
+        expect(await readdir(root)).toEqual(["aliased.pck"]);
+      }
+    }
   },
   30000,
 );
