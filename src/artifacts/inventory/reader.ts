@@ -96,8 +96,6 @@ export const inventoryCoverage = (
     };
   return {
     coverage: { scope: "root", status: "complete" },
-    limitations: [
-      "Only the root artifact was inventoried; no supported child-container format was established.",
-    ],
+    limitations: ["Artifact has no child container entries."],
   };
 };
